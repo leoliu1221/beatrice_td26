@@ -1,0 +1,9 @@
+*.lock
+work/*
+__pycache__
+inputs_data_raw
+lol
+lol_data
+lol_out
+noxus
+noxus_out
