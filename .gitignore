@@ -4,3 +4,5 @@ __pycache__
 inputs
 outputs
 preprocessed
+datasets
+_inspect_*.py
