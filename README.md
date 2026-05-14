@@ -286,21 +286,65 @@ python3 beatrice_trainer -d <your_training_data_dir> -o <output_dir> -r
 
 ## Local Workflow Notes (this fork)
 
-### Preprocessing long recordings
+### Project layout
 
-`preprocess.py` splits long single-speaker recordings into Beatrice-ready clips
-using [auditok](https://github.com/amsehili/auditok) silence-based segmentation,
-resamples to 24 kHz mono, and writes one speaker subdir per source.
-
-Edit the `SOURCES` list at the top of `preprocess.py` to point at your
-inputs, then:
-
-```powershell
-uv pip install auditok
-uv run python preprocess.py
+```
+inputs/<dataset>/...           raw long recordings (any audio format)
+preprocessed/<dataset>/...     segmented clips fed to the trainer (auto-generated)
+outputs/<dataset>/             paraphernalia + checkpoints + config (auto-generated)
 ```
 
-Tunable knobs inside the script:
+A "dataset" is just a folder name under `inputs/`. You can have several in
+parallel — e.g. `inputs/lol_data/`, `inputs/anime_voices/`, etc.
+
+**Recommended layout — one folder per speaker** (supports multiple files per
+speaker, which all get concatenated):
+
+```
+inputs/lol_data/
+  sion/
+    sion_new.wav
+    sion_taunts.wav         (optional extra files)
+    sion_quotes.flac
+  teemo/
+    teemo_new.wav
+```
+
+Speaker name = the subfolder name. Supported audio extensions: `.wav`, `.flac`,
+`.mp3`, `.ogg`, `.m4a`, `.aac`.
+
+A flat layout also works for single-file-per-speaker cases:
+
+```
+inputs/lol_data/
+  Sion Edit for TD.wav      -> speaker "sion"  (first word of stem, lowercased)
+  Teemo Edit for TD.wav     -> speaker "teemo"
+```
+
+### One-command training (via Makefile)
+
+Install GNU Make on Windows once: `winget install -e --id GnuWin32.Make`,
+then add `C:\Program Files (x86)\GnuWin32\bin` to PATH.
+
+```powershell
+make                       # preprocess + train, DATASET=lol_data (default)
+make DATASET=other_set     # same, different dataset
+make preprocess            # only segment audio
+make train                 # only run trainer
+make resume                # resume from outputs/<dataset>/checkpoint_latest.pt.gz
+make tensorboard           # launch TensorBoard on the dataset
+make clean                 # wipe preprocessed/<dataset> and outputs/<dataset>
+```
+
+The `train` target auto-copies `assets/default_config.json` to
+`outputs/<dataset>/config.json` on first run. Edit that file to override
+hyperparameters; subsequent `make train` runs reuse the same file.
+
+### Preprocessing details
+
+`preprocess.py` uses [auditok](https://github.com/amsehili/auditok) for
+silence-based segmentation, resamples to 24 kHz mono PCM_16, and writes one
+speaker subdir per source. Tunable constants at the top of the script:
 
 - `MIN_DUR` / `MAX_DUR` — target clip length window (default 4–15 s).
 - `MAX_SILENCE` — silence tolerated *inside* a region (default 0.3 s).
@@ -308,22 +352,8 @@ Tunable knobs inside the script:
   voices; raise it (55–60) for noisy sources, lower it (35–40) for very
   quiet/deep voices.
 
-Output layout (multi-speaker):
-
-```
-lol_data/
-  sion/   sion_0000.wav, sion_0001.wav, ...
-  teemo/  teemo_0000.wav, teemo_0001.wav, ...
-```
-
-Each speaker subdir becomes one speaker_id in the resulting paraphernalia, so
-the VST will let you pick between them.
-
-### Training command (this fork)
-
-```powershell
-uv run python -m beatrice_trainer -d lol_data -o lol_out -c lol_out\config.json
-```
+Multiple source files for the same speaker (matched by subfolder name) are
+concatenated into one speaker dir with incrementing clip indices.
 
 ### Performance notes on Windows + RTX 3080 Ti
 
