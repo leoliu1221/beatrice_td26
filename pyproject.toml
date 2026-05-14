@@ -16,6 +16,7 @@ dependencies = [
     "tensorboard>=2",
     "soundfile>=0.11",
     "pyworld>=0.3.2",
+    "auditok>=0.3",
 ]
 
 [project.optional-dependencies]
