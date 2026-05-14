@@ -281,3 +281,86 @@ python3 beatrice_trainer -d <your_training_data_dir> -o <output_dir> -r
 
 このリポジトリ内のソースコードおよび学習済みモデルは MIT License のもとで公開されています。
 詳しくは [LICENSE](https://huggingface.co/fierce-cats/beatrice-trainer/blob/main/LICENSE) をご覧ください。
+
+---
+
+## Local Workflow Notes (this fork)
+
+### Preprocessing long recordings
+
+`preprocess.py` splits long single-speaker recordings into Beatrice-ready clips
+using [auditok](https://github.com/amsehili/auditok) silence-based segmentation,
+resamples to 24 kHz mono, and writes one speaker subdir per source.
+
+Edit the `SOURCES` list at the top of `preprocess.py` to point at your
+inputs, then:
+
+```powershell
+uv pip install auditok
+uv run python preprocess.py
+```
+
+Tunable knobs inside the script:
+
+- `MIN_DUR` / `MAX_DUR` — target clip length window (default 4–15 s).
+- `MAX_SILENCE` — silence tolerated *inside* a region (default 0.3 s).
+- `ENERGY_THRESHOLD` — speech detection threshold. Default 45 works for most
+  voices; raise it (55–60) for noisy sources, lower it (35–40) for very
+  quiet/deep voices.
+
+Output layout (multi-speaker):
+
+```
+lol_data/
+  sion/   sion_0000.wav, sion_0001.wav, ...
+  teemo/  teemo_0000.wav, teemo_0001.wav, ...
+```
+
+Each speaker subdir becomes one speaker_id in the resulting paraphernalia, so
+the VST will let you pick between them.
+
+### Training command (this fork)
+
+```powershell
+uv run python -m beatrice_trainer -d lol_data -o lol_out -c lol_out\config.json
+```
+
+### Performance notes on Windows + RTX 3080 Ti
+
+Measured on a 16-core CPU / RTX 3080 Ti (12 GB) box. Fine-tuning at the shipped
+defaults runs at **~2.4 it/s** (~70 min for 10k steps). GPU utilization
+oscillates 0–100% with average ~50–60% — the pipeline is **CPU-bound**, not
+GPU-bound, due to per-sample data augmentation (reverb conv, noise mixing,
+formant shift via resampling) on the DataLoader workers.
+
+Counter-intuitive results from local tuning experiments:
+
+| Change                            | Effect                                          |
+|---|---|
+| `batch_size: 12`                  | **−60% throughput** (VRAM 11.9/12 GB → cuDNN picks slow algos) |
+| `num_workers: 8` (down from 16)   | **−11% throughput** (more data starvation)      |
+| `compile_*: true`                 | Crashes — Triton not available on Windows       |
+| **Defaults (`bs=8, nw=16`)**      | **Best on this hardware**                        |
+
+The shipped `assets/default_config.json` is already well-tuned for Windows.
+Only meaningful wins available are:
+
+- Switch to Linux/WSL2 to enable `torch.compile` (Triton works there).
+- Lower `augmentation_reverb_probability` from 0.5 to ~0.2 to reduce CPU
+  augmentation cost (quality tradeoff).
+
+### English voice conversion — known caveat
+
+The default pretrained generator base
+(`assets/pretrained/151_checkpoint_libritts_r_200_02750000.pt.gz`) is trained on
+**LibriTTS-R (English)** — that part is fine. However, the frozen
+PhoneExtractor (`122_checkpoint_03000000.pt`) is trained on a mixed corpus
+including ReazonSpeech (Japanese), so cross-lingual VC can carry a slight
+Japanese phonetic bias. Stronger contributors to Japanese-sounding output when
+fine-tuning are:
+
+1. Target-speaker training data being Japanese.
+2. The per-speaker VQ codebook being initialized from limited Japanese audio.
+
+Increasing target-speaker data volume and phonetic variety mitigates both.
+
