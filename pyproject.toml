@@ -17,6 +17,7 @@ dependencies = [
     "soundfile>=0.11",
     "pyworld>=0.3.2",
     "auditok>=0.3",
+    "setuptools<81",  # tensorboard 2.20 still imports pkg_resources (removed in setuptools 81+)
 ]
 
 [project.optional-dependencies]
