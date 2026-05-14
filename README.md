@@ -306,12 +306,18 @@ inputs/lol_data/
     sion_new.wav
     sion_taunts.wav         (optional extra files)
     sion_quotes.flac
+    notes.txt               (ignored — not an audio extension)
+    misc_clip.wav           (ignored — filename doesn't start with "sion")
   teemo/
     teemo_new.wav
 ```
 
-Speaker name = the subfolder name. Supported audio extensions: `.wav`, `.flac`,
-`.mp3`, `.ogg`, `.m4a`, `.aac`.
+Speaker name = the subfolder name. **Files in a speaker subfolder are only
+processed if their filename's first word matches the subfolder name.**
+This lets you keep unrelated wavs (reference tracks, test renders) alongside
+the training audio without contaminating the speaker.
+
+Supported audio extensions: `.wav`, `.flac`, `.mp3`, `.ogg`, `.m4a`, `.aac`.
 
 A flat layout also works for single-file-per-speaker cases:
 

@@ -35,22 +35,37 @@ MAX_SILENCE = 0.3
 ENERGY_THRESHOLD = 45  # lower = more permissive
 
 
-def _slug(name: str) -> str:
-    # take first whitespace-delimited token, drop non-alphanum, lowercase
-    token = name.strip().split()[0]
-    return re.sub(r"[^a-z0-9]+", "_", token.lower()).strip("_") or "speaker"
+def _first_token(s: str) -> str:
+    """First alphanumeric run of `s`, lowercased. e.g. 'Sion Edit' -> 'sion'."""
+    m = re.match(r"[a-zA-Z0-9]+", s.strip())
+    return m.group(0).lower() if m else ""
 
 
 def discover(dataset_dir: Path):
-    """Yield (speaker, source_file) tuples for one dataset directory."""
+    """Yield (speaker, source_file) tuples for one dataset directory.
+
+    Layout rules:
+      <dataset>/<file>.<ext>                  -> speaker = first word of filename
+      <dataset>/<speaker>/<file>.<ext>        -> speaker = subfolder name; the file's
+                                                 first word must match <speaker>,
+                                                 otherwise the file is skipped.
+    """
     for path in sorted(dataset_dir.rglob("*")):
         if not path.is_file() or path.suffix.lower() not in AUDIO_EXTS:
             continue
         rel = path.relative_to(dataset_dir)
         if len(rel.parts) == 1:
-            speaker = _slug(path.stem)
+            speaker = _first_token(path.stem)
         else:
-            speaker = _slug(rel.parts[0])
+            speaker = _first_token(rel.parts[0])
+            file_word = _first_token(path.stem)
+            if file_word != speaker:
+                print(
+                    f"  skip (filename '{path.name}' doesn't start with '{speaker}')"
+                )
+                continue
+        if not speaker:
+            continue
         yield speaker, path
 
 
