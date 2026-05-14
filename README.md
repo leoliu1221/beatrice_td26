@@ -355,13 +355,55 @@ speaker subdir per source. Tunable constants at the top of the script:
 Multiple source files for the same speaker (matched by subfolder name) are
 concatenated into one speaker dir with incrementing clip indices.
 
+### Multi-speaker training
+
+The trainer handles N speakers natively — each subfolder under
+`preprocessed/<dataset>/` becomes one selectable target voice in the final
+paraphernalia. Internally the generator carries three speaker-keyed tables
+(`embed_speaker`, `key_value_speaker_embedding`, `vq.codebooks`); the frozen
+PhoneExtractor and PitchEstimator are shared. Per-sample conditioning means a
+single batch can mix speakers freely.
+
+Practical guidance when scaling speaker count:
+
+- **`n_steps` should scale with speaker count.** Per-speaker gradient updates ≈
+  `n_steps × batch_size ÷ n_speakers` (weighted by per-speaker clip count).
+  Aim for **≥20k updates per speaker** for a strong fine-tune. The shipped
+  default `n_steps: 50000` gives ~33k updates per speaker for 12 speakers at
+  `batch_size: 8` — solid quality. Drop to ~30000 if you're impatient, bump to
+  80000 for stronger speaker identity.
+- **Balance per-speaker clip counts.** Sampling is per-file, so a speaker with
+  10× the clips gets 10× the updates per epoch. Trim outliers or accept that
+  rare speakers will underfit.
+- **Per-speaker audio target: ≥2 min of varied speech.** This is plenty for
+  both VQ codebook initialization and identity learning. Game-voice-line packs
+  with battle cries / taunts / abilities easily exceed this in ~5 min.
+- **VRAM impact is negligible** — the per-speaker tables add ~3 MB per extra
+  speaker. `batch_size: 8` remains correct regardless of speaker count.
+
+### VQ codebook initialization (clarification)
+
+The per-speaker 512-entry VQ codebook is k-means-initialized from **every
+frame of every clip** of that speaker (PhoneExtractor frame rate ~50 Hz). The
+trainer concatenates frames across clips, so the codebook is **insensitive to
+how the audio is split** — 1 long file or 100 short clips both produce
+identical results.
+
+Hard minimum: ~10 s of speech per speaker (below this, the k-means falls back
+to a degenerate "pad-replicate" initialization at
+`@/c:/Users/ll771/workspace/beatrice-trainer/beatrice_trainer/__main__.py:1050-1053`).
+
+In practice anything ≥30 s of varied speech gives a healthy codebook
+(60+ × the 512 codebook size).
+
 ### Performance notes on Windows + RTX 3080 Ti
 
-Measured on a 16-core CPU / RTX 3080 Ti (12 GB) box. Fine-tuning at the shipped
-defaults runs at **~2.4 it/s** (~70 min for 10k steps). GPU utilization
-oscillates 0–100% with average ~50–60% — the pipeline is **CPU-bound**, not
-GPU-bound, due to per-sample data augmentation (reverb conv, noise mixing,
-formant shift via resampling) on the DataLoader workers.
+Measured on a 16-core CPU / RTX 3080 Ti (12 GB) box. Fine-tuning runs at
+**~2.4 it/s** — about **70 min per 10k steps**, so the shipped default of
+`n_steps: 50000` takes ~5.8 h. GPU utilization oscillates 0–100% with average
+~50–60% — the pipeline is **CPU-bound**, not GPU-bound, due to per-sample data
+augmentation (reverb conv, noise mixing, formant shift via resampling) on the
+DataLoader workers.
 
 Counter-intuitive results from local tuning experiments:
 
