@@ -1,52 +1,72 @@
-"""Split long single-speaker recordings into Beatrice-ready training clips.
+"""Auto-discover long recordings under inputs/ and segment them into
+Beatrice-ready training clips written to preprocessed/.
+
+Layout conventions:
+  inputs/<dataset>/<speaker>.<ext>          -> speaker = first word of stem, lowercased
+  inputs/<dataset>/<speaker>/<anything>.<ext>  -> speaker = parent dir name, lowercased
+  inputs/<dataset>/<speaker>/sub/.../*.<ext>   -> speaker = top-level subdir under dataset
+
+Output:
+  preprocessed/<dataset>/<speaker>/<speaker>_NNNN.wav (mono, 24 kHz, PCM_16)
 
 Usage:
-    uv run python preprocess.py
+    uv run python preprocess.py                 # process every dataset under inputs/
+    uv run python preprocess.py --dataset lol_data  # only one
 """
 
+import argparse
+import re
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
 import soundfile as sf
-import torch
 import torchaudio
 from auditok import split
 
-SOURCES = [
-    ("sion", Path("noxus_new/sion_new/Sion Edit for TD.wav")),
-    ("teemo", Path("yordle_new/teemo_new/Teemo Edit for TD.wav")),
-]
-OUT_ROOT = Path("lol_data")
+INPUTS_ROOT = Path("inputs")
+PREPROCESSED_ROOT = Path("preprocessed")
+AUDIO_EXTS = {".wav", ".flac", ".mp3", ".ogg", ".m4a", ".aac"}
+
 TARGET_SR = 24000  # Beatrice out_sample_rate
 MIN_DUR = 4.0  # seconds; must be >= wav_length (4s)
 MAX_DUR = 15.0
-MAX_SILENCE = 0.3  # seconds of silence allowed inside a region
-ENERGY_THRESHOLD = 45  # auditok energy threshold (lower = more permissive)
+MAX_SILENCE = 0.3
+ENERGY_THRESHOLD = 45  # lower = more permissive
 
 
-def process_one(speaker: str, src: Path):
-    out_dir = OUT_ROOT / speaker
-    out_dir.mkdir(parents=True, exist_ok=True)
-    # wipe any previous run
-    for p in out_dir.glob("*.wav"):
-        p.unlink()
+def _slug(name: str) -> str:
+    # take first whitespace-delimited token, drop non-alphanum, lowercase
+    token = name.strip().split()[0]
+    return re.sub(r"[^a-z0-9]+", "_", token.lower()).strip("_") or "speaker"
 
-    print(f"\n[{speaker}] reading {src} ...")
+
+def discover(dataset_dir: Path):
+    """Yield (speaker, source_file) tuples for one dataset directory."""
+    for path in sorted(dataset_dir.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in AUDIO_EXTS:
+            continue
+        rel = path.relative_to(dataset_dir)
+        if len(rel.parts) == 1:
+            speaker = _slug(path.stem)
+        else:
+            speaker = _slug(rel.parts[0])
+        yield speaker, path
+
+
+def segment_file(src: Path, start_index: int, out_dir: Path, speaker: str) -> tuple[int, float]:
+    print(f"  reading {src.name} ...")
     wav, sr = torchaudio.load(str(src), backend="soundfile")
-    # mono
     if wav.size(0) > 1:
         wav = wav.mean(0, keepdim=True)
-    # resample to 24k once
     if sr != TARGET_SR:
         wav = torchaudio.functional.resample(wav, sr, TARGET_SR)
-    # peak-normalize lightly to avoid clipping after resample
     peak = wav.abs().max().item()
     if peak > 0:
         wav = wav * min(1.0, 0.95 / peak)
 
     pcm16 = (wav.squeeze(0).numpy() * 32767.0).clip(-32768, 32767).astype(np.int16)
 
-    # auditok wants a file or bytes; feed bytes for speed
     regions = split(
         pcm16.tobytes(),
         sampling_rate=TARGET_SR,
@@ -60,29 +80,76 @@ def process_one(speaker: str, src: Path):
 
     n = 0
     total = 0.0
-    for i, region in enumerate(regions):
-        start_s = region.start
-        end_s = region.end
-        dur = end_s - start_s
+    for region in regions:
+        dur = region.end - region.start
         if dur < MIN_DUR:
             continue
-        s0 = int(start_s * TARGET_SR)
-        s1 = int(end_s * TARGET_SR)
-        clip = pcm16[s0:s1]
-        out_path = out_dir / f"{speaker}_{i:04d}.wav"
-        sf.write(str(out_path), clip, TARGET_SR, subtype="PCM_16")
+        s0 = int(region.start * TARGET_SR)
+        s1 = int(region.end * TARGET_SR)
+        out_path = out_dir / f"{speaker}_{start_index + n:04d}.wav"
+        sf.write(str(out_path), pcm16[s0:s1], TARGET_SR, subtype="PCM_16")
         n += 1
         total += dur
+    return n, total
 
-    print(f"[{speaker}] wrote {n} clips, {total:.1f}s total speech -> {out_dir}")
+
+def process_dataset(dataset_dir: Path):
+    name = dataset_dir.name
+    out_root = PREPROCESSED_ROOT / name
+    print(f"\n=== dataset: {name} ===")
+
+    # group source files by speaker so multiple files per speaker concatenate
+    grouped: dict[str, list[Path]] = defaultdict(list)
+    for speaker, src in discover(dataset_dir):
+        grouped[speaker].append(src)
+
+    if not grouped:
+        print(f"  (no audio files found under {dataset_dir})")
+        return
+
+    for speaker, sources in grouped.items():
+        out_dir = out_root / speaker
+        out_dir.mkdir(parents=True, exist_ok=True)
+        # wipe previous run for this speaker
+        for p in out_dir.glob("*.wav"):
+            p.unlink()
+
+        print(f"\n[{name}/{speaker}] {len(sources)} source file(s)")
+        total_clips = 0
+        total_speech = 0.0
+        for src in sources:
+            n, secs = segment_file(src, total_clips, out_dir, speaker)
+            total_clips += n
+            total_speech += secs
+        print(
+            f"[{name}/{speaker}] wrote {total_clips} clips, "
+            f"{total_speech:.1f}s total speech -> {out_dir}"
+        )
 
 
 def main():
-    for speaker, src in SOURCES:
-        if not src.is_file():
-            print(f"MISSING: {src}")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dataset", help="only process this dataset name (folder under inputs/)")
+    ap.add_argument("--inputs-root", default=str(INPUTS_ROOT))
+    args = ap.parse_args()
+
+    inputs_root = Path(args.inputs_root)
+    if not inputs_root.is_dir():
+        raise SystemExit(f"inputs root not found: {inputs_root}")
+
+    if args.dataset:
+        candidates = [inputs_root / args.dataset]
+    else:
+        candidates = [p for p in sorted(inputs_root.iterdir()) if p.is_dir()]
+
+    if not candidates:
+        raise SystemExit(f"no datasets under {inputs_root}")
+
+    for d in candidates:
+        if not d.is_dir():
+            print(f"skip (not a dir): {d}")
             continue
-        process_one(speaker, src)
+        process_dataset(d)
 
 
 if __name__ == "__main__":
