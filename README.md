@@ -336,8 +336,9 @@ then add `C:\Program Files (x86)\GnuWin32\bin` to PATH.
 make                       # preprocess + train, DATASET=lol_data (default)
 make DATASET=other_set     # same, different dataset
 make preprocess            # only segment audio
-make train                 # only run trainer
-make resume                # resume from outputs/<dataset>/checkpoint_latest.pt.gz
+make train                 # only run trainer (fresh)
+make train RESUME=1        # resume after running preprocess (use if inputs/ changed)
+make resume                # resume WITHOUT preprocessing — recommended
 make tensorboard           # launch TensorBoard on the dataset
 make clean                 # wipe preprocessed/<dataset> and outputs/<dataset>
 ```
@@ -345,6 +346,21 @@ make clean                 # wipe preprocessed/<dataset> and outputs/<dataset>
 The `train` target auto-copies `assets/default_config.json` to
 `outputs/<dataset>/config.json` on first run. Edit that file to override
 hyperparameters; subsequent `make train` runs reuse the same file.
+
+Note that `preprocess.py` is **destructive** — every invocation wipes
+`preprocessed/<dataset>/<speaker>/*.wav` and re-segments from
+`inputs/`. So:
+
+- Use **`make resume`** to continue training from `checkpoint_latest.pt.gz`.
+  It runs only the trainer with `-r` and leaves preprocessed clips untouched.
+- Use **`make train RESUME=1`** only if you've changed something under
+  `inputs/<dataset>/` and want preprocessing to re-run before resuming.
+  (`RESUME=1` just appends `-r` to the trainer call; any non-empty value works.)
+
+> **TensorBoard note.** TensorBoard imports `pkg_resources`, which lives in
+> `setuptools`. The project already declares `setuptools` as a dependency, but
+> if you ever see `ModuleNotFoundError: No module named 'pkg_resources'`, run
+> `uv add setuptools` to re-pin it into the locked env.
 
 ### Preprocessing details
 
