@@ -147,31 +147,63 @@ class PitchDataset(Dataset):
         wav = wav.squeeze(0)  # [T]
         total = wav.size(0)
         
-        if total < self.wav_length:
-            # Pad short clips - use replicate padding which works for 1D
-            # For very short clips, repeat the audio until we have enough
-            if total < self.wav_length // 2:
-                # Repeat the audio multiple times
-                repeats = (self.wav_length // total) + 1
-                wav = wav.repeat(repeats)[:self.wav_length]
-            else:
-                # Pad with zeros (constant) - simpler and always works
-                pad = self.wav_length - total
-                wav = torch.nn.functional.pad(wav, (0, pad), mode="constant", value=0.0)
-            start = 0
-        else:
-            start = self._rng.randint(0, total - self.wav_length)
-            wav = wav[start : start + self.wav_length]
+        # Check for pre-computed F0
+        f0_path = path.with_suffix(path.suffix + ".f0.npy")
+        has_precomputed_f0 = f0_path.exists()
         
-        # Extract F0 from the cropped waveform
-        wav_np = wav.numpy()
-        f0 = extract_f0_pyworld(
-            wav_np,
-            sample_rate=self.sample_rate,
-            hop_length=self.hop_length,
-            f0_floor=self.f0_floor,
-            f0_ceil=self.f0_ceil,
-        )
+        if has_precomputed_f0:
+            # Load pre-computed F0 (much faster!)
+            f0_full = np.load(f0_path)
+            f0_frames = len(f0_full)
+            wav_frames = total // self.hop_length
+            
+            # Determine crop position
+            crop_frames = self.wav_length // self.hop_length
+            if wav_frames <= crop_frames:
+                start_frame = 0
+                start_sample = 0
+            else:
+                max_start_frame = wav_frames - crop_frames
+                start_frame = self._rng.randint(0, max_start_frame)
+                start_sample = start_frame * self.hop_length
+            
+            # Crop waveform
+            if total < self.wav_length:
+                if total < self.wav_length // 2:
+                    repeats = (self.wav_length // total) + 1
+                    wav = wav.repeat(repeats)[:self.wav_length]
+                else:
+                    pad = self.wav_length - total
+                    wav = torch.nn.functional.pad(wav, (0, pad), mode="constant", value=0.0)
+            else:
+                wav = wav[start_sample : start_sample + self.wav_length]
+            
+            # Crop F0
+            if f0_frames <= crop_frames:
+                f0 = f0_full
+            else:
+                f0 = f0_full[start_frame : start_frame + crop_frames]
+        else:
+            # Fall back to on-the-fly extraction
+            if total < self.wav_length:
+                if total < self.wav_length // 2:
+                    repeats = (self.wav_length // total) + 1
+                    wav = wav.repeat(repeats)[:self.wav_length]
+                else:
+                    pad = self.wav_length - total
+                    wav = torch.nn.functional.pad(wav, (0, pad), mode="constant", value=0.0)
+            else:
+                start = self._rng.randint(0, total - self.wav_length)
+                wav = wav[start : start + self.wav_length]
+            
+            wav_np = wav.numpy()
+            f0 = extract_f0_pyworld(
+                wav_np,
+                sample_rate=self.sample_rate,
+                hop_length=self.hop_length,
+                f0_floor=self.f0_floor,
+                f0_ceil=self.f0_ceil,
+            )
         
         # Convert F0 to pitch bins
         pitch_bins = f0_to_pitch_bin(
