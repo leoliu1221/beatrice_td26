@@ -22,6 +22,15 @@
 #                            # warm-start from shipped Japanese-leaning ckpt
 #   make phone-export        # export latest training ckpt -> Beatrice format
 #   make phone-tensorboard   # tail phone-extractor TensorBoard
+#
+# PitchEstimator sub-trainer (pyworld-supervised, for better cross-gender conversion):
+#   make pitch-train PITCH_DATA=/path/to/diverse_pitch_audio
+#                            # train new pitch estimator from scratch
+#   make pitch-train PITCH_DATA=... PITCH_INIT=assets/pretrained/104_3_checkpoint_00300000.pt
+#                            # warm-start from shipped ckpt
+#   make pitch-export        # export latest training ckpt -> Beatrice format
+#   make pitch-tensorboard   # tail pitch-estimator TensorBoard
+
 
 DATASET       ?= lol_data
 RESUME        ?=
@@ -49,8 +58,20 @@ PHONE_EXPORT_OUT ?= assets/pretrained/phone_extractor_en.pt
 PHONE_INIT_FLAG := $(if $(PHONE_INIT),--init-from $(PHONE_INIT),)
 PHONE_RESUME_FLAG := $(if $(RESUME),--resume,)
 
+# PitchEstimator trainer variables
+PITCH_DATA    ?=
+PITCH_OUT     ?= outputs/pitch_estimator_v2
+PITCH_INIT    ?= assets/pretrained/104_3_checkpoint_00300000.pt
+PITCH_STEPS   ?= 300000
+PITCH_BATCH   ?= 32
+PITCH_WORKERS ?= 4
+PITCH_EXPORT_OUT ?= assets/pretrained/pitch_estimator_v2.pt
+PITCH_INIT_FLAG := $(if $(PITCH_INIT),--init-from $(PITCH_INIT),)
+PITCH_RESUME_FLAG := $(if $(RESUME),--resume,)
+
 .PHONY: all preprocess config train resume tensorboard clean help \
-        phone-data-download phone-train phone-train-en phone-export phone-tensorboard
+        phone-data-download phone-train phone-train-en phone-export phone-tensorboard \
+        pitch-train pitch-export pitch-tensorboard
 
 all: train
 
@@ -116,3 +137,40 @@ phone-export:
 
 phone-tensorboard:
 	$(PY) -m tensorboard.main --logdir $(PHONE_OUT)
+
+# --- PitchEstimator sub-trainer -----------------------------------------------
+#
+# For better female-to-male (and male-to-female) voice conversion, retrain the
+# pitch estimator on diverse pitch data covering both male and female ranges.
+#
+# Recommended data sources:
+#   - VocalSet (singing, wide pitch range)
+#   - VCTK (multi-speaker, male+female)
+#   - LibriTTS-R (audiobook, diverse speakers)
+#   - Your own male+female speech recordings
+#
+# Step-by-step:
+#   make pitch-train PITCH_DATA=/path/to/diverse_audio
+#                              # 300k steps, ~12 h on RTX 3080 Ti
+#   make pitch-train RESUME=1  # resume an interrupted run
+#   make pitch-export          # write Beatrice-format .pt
+#   make pitch-tensorboard     # live training curves
+
+pitch-train:
+	@if [ -z "$(PITCH_DATA)" ]; then echo "PITCH_DATA=/path/to/diverse_pitch_audio is required"; exit 1; fi
+	$(PY) -m pitch_estimator_trainer.train \
+		--data-dir $(PITCH_DATA) \
+		--out-dir $(PITCH_OUT) \
+		--steps $(PITCH_STEPS) \
+		--batch-size $(PITCH_BATCH) \
+		--num-workers $(PITCH_WORKERS) \
+		$(PITCH_INIT_FLAG) \
+		$(PITCH_RESUME_FLAG)
+
+pitch-export:
+	$(PY) -m pitch_estimator_trainer.export \
+		$(PITCH_OUT)/checkpoint_latest.pt \
+		$(PITCH_EXPORT_OUT)
+
+pitch-tensorboard:
+	$(PY) -m tensorboard.main --logdir $(PITCH_OUT)
