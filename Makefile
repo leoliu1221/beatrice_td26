@@ -59,19 +59,21 @@ PHONE_INIT_FLAG := $(if $(PHONE_INIT),--init-from $(PHONE_INIT),)
 PHONE_RESUME_FLAG := $(if $(RESUME),--resume,)
 
 # PitchEstimator trainer variables
-PITCH_DATA    ?=
+VCTK_ROOT     := datasets/vctk
+VCTK_DIR      := $(VCTK_ROOT)/VCTK-Corpus-0.92/wav48_silence_trimmed
+PITCH_DATA    ?= $(VCTK_DIR)
 PITCH_OUT     ?= outputs/pitch_estimator_v2
 PITCH_INIT    ?= assets/pretrained/104_3_checkpoint_00300000.pt
 PITCH_STEPS   ?= 300000
-PITCH_BATCH   ?= 32
-PITCH_WORKERS ?= 4
+PITCH_BATCH   ?= 256
+PITCH_WORKERS ?= 8
 PITCH_EXPORT_OUT ?= assets/pretrained/pitch_estimator_v2.pt
 PITCH_INIT_FLAG := $(if $(PITCH_INIT),--init-from $(PITCH_INIT),)
 PITCH_RESUME_FLAG := $(if $(RESUME),--resume,)
 
 .PHONY: all preprocess config train resume tensorboard clean help \
         phone-data-download phone-train phone-train-en phone-export phone-tensorboard \
-        pitch-train pitch-export pitch-tensorboard
+        pitch-data-download pitch-preprocess pitch-train pitch-train-vctk pitch-export pitch-tensorboard
 
 all: train
 
@@ -149,12 +151,25 @@ phone-tensorboard:
 #   - LibriTTS-R (audiobook, diverse speakers)
 #   - Your own male+female speech recordings
 #
-# Step-by-step:
-#   make pitch-train PITCH_DATA=/path/to/diverse_audio
-#                              # 300k steps, ~12 h on RTX 3080 Ti
-#   make pitch-train RESUME=1  # resume an interrupted run
-#   make pitch-export          # write Beatrice-format .pt
-#   make pitch-tensorboard     # live training curves
+# One-shot end-to-end with VCTK:
+#   make pitch-train-vctk        # download VCTK + preprocess F0 + train + export
+#
+# Or step-by-step:
+#   make pitch-data-download     # ~11 GB, ~15-30 min depending on connection
+#   make pitch-preprocess        # pre-extract F0 (~10 min with 28 workers)
+#   make pitch-train             # 300k steps, ~3-4 h on RTX 4070 Ti (with preprocessing)
+#   make pitch-train RESUME=1    # resume an interrupted run
+#   make pitch-export            # write Beatrice-format .pt
+#   make pitch-tensorboard       # live training curves
+
+pitch-data-download:
+	$(PY) -c "import torchaudio, pathlib; root=pathlib.Path(r'$(VCTK_ROOT)'); root.mkdir(parents=True, exist_ok=True); d=pathlib.Path(r'$(VCTK_DIR)'); print('already downloaded:', d) if d.is_dir() else (torchaudio.datasets.VCTK_092(str(root), download=True), print('downloaded to', d))"
+
+pitch-preprocess:
+	@if [ ! -d "$(PITCH_DATA)" ]; then echo "PITCH_DATA directory not found: $(PITCH_DATA)"; exit 1; fi
+	$(PY) -m pitch_estimator_trainer.preprocess \
+		--data-dir $(PITCH_DATA) \
+		--num-workers 28
 
 pitch-train:
 	@if [ -z "$(PITCH_DATA)" ]; then echo "PITCH_DATA=/path/to/diverse_pitch_audio is required"; exit 1; fi
@@ -166,6 +181,10 @@ pitch-train:
 		--num-workers $(PITCH_WORKERS) \
 		$(PITCH_INIT_FLAG) \
 		$(PITCH_RESUME_FLAG)
+
+pitch-train-vctk: pitch-data-download pitch-preprocess
+	$(MAKE) pitch-train
+	$(MAKE) pitch-export
 
 pitch-export:
 	$(PY) -m pitch_estimator_trainer.export \

@@ -48,7 +48,7 @@
         4000.0,
         6000.0
     ],
-    "phone_extractor_file": "assets/pretrained/122_checkpoint_03000000.pt",
+    "phone_extractor_file": "assets/pretrained/phone_extractor_en.pt",
     "pitch_estimator_file": "assets/pretrained/104_3_checkpoint_00300000.pt",
     "in_ir_wav_dir": "assets/ir",
     "in_noise_wav_dir": "assets/noise",
