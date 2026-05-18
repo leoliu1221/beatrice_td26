@@ -36,8 +36,9 @@ ENERGY_THRESHOLD = 45  # lower = more permissive
 
 
 def _first_token(s: str) -> str:
-    """First alphanumeric run of `s`, lowercased. e.g. 'Sion Edit' -> 'sion'."""
-    m = re.match(r"[a-zA-Z0-9]+", s.strip())
+    """First alphanumeric run (including underscores) of `s`, lowercased.
+    e.g. 'Sion Edit' -> 'sion', 'yordle_female.wav' -> 'yordle_female'."""
+    m = re.match(r"[a-zA-Z0-9_]+", s.strip())
     return m.group(0).lower() if m else ""
 
 

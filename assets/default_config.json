@@ -16,7 +16,7 @@
     "grad_balancer_ema_decay": 0.995,
     "use_amp": true,
     "num_workers": 16,
-    "n_steps": 50000,
+    "n_steps": 60000,
     "warmup_steps": 10000,
     "evaluation_interval": 5000,
     "save_interval": 5000,
@@ -49,7 +49,7 @@
         6000.0
     ],
     "phone_extractor_file": "assets/pretrained/phone_extractor_en.pt",
-    "pitch_estimator_file": "assets/pretrained/104_3_checkpoint_00300000.pt",
+    "pitch_estimator_file": "assets/pretrained/pitch_estimator_v2.pt",
     "in_ir_wav_dir": "assets/ir",
     "in_noise_wav_dir": "assets/noise",
     "in_test_wav_dir": "assets/test",

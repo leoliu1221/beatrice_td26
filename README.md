@@ -152,6 +152,19 @@ MIT License. See [LICENSE](LICENSE) for details.
 
 ---
 
+## Pretrained Models
+
+This fork includes retrained feature extractors optimized for English voice conversion:
+
+| Model | File | Training Data | Purpose |
+|-------|------|---------------|---------|
+| **PhoneExtractor** | `phone_extractor_en.pt` | LibriSpeech 960h | English-only phonetic features (removes Japanese bias) |
+| **PitchEstimator** | `pitch_estimator_v2.pt` | VCTK (109 speakers) | Improved cross-gender pitch tracking |
+
+These are configured in `assets/default_config.json` and used automatically when training voice models.
+
+---
+
 ## Credits
 
 - Original [Beatrice Trainer](https://huggingface.co/fierce-cats/beatrice-trainer) by Project Beatrice
