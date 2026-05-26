@@ -27,7 +27,7 @@
     "phone_noise_ratio": 0.5,
     "vq_topk": 4,
     "training_time_vq": "none",
-    "floor_noise_level": 1e-3,
+    "floor_noise_level": 1e-4,
     "record_metrics": false,
     "augmentation_snr_candidates": [
         20.0,
