@@ -32,7 +32,7 @@ TARGET_SR = 24000  # Beatrice out_sample_rate
 MIN_DUR = 4.0  # seconds; must be >= wav_length (4s)
 MAX_DUR = 15.0
 MAX_SILENCE = 0.3
-ENERGY_THRESHOLD = 45  # lower = more permissive
+ENERGY_THRESHOLD = 45  # lower = more permissive (denoised audio may need ~35)
 
 
 def _first_token(s: str) -> str:
@@ -70,7 +70,16 @@ def discover(dataset_dir: Path):
         yield speaker, path
 
 
-def segment_file(src: Path, start_index: int, out_dir: Path, speaker: str) -> tuple[int, float]:
+def segment_file(
+    src: Path,
+    start_index: int,
+    out_dir: Path,
+    speaker: str,
+    energy_threshold: float = ENERGY_THRESHOLD,
+    min_dur: float = MIN_DUR,
+    max_dur: float = MAX_DUR,
+    max_silence: float = MAX_SILENCE,
+) -> tuple[int, float]:
     print(f"  reading {src.name} ...")
     wav, sr = torchaudio.load(str(src), backend="soundfile")
     if wav.size(0) > 1:
@@ -88,17 +97,17 @@ def segment_file(src: Path, start_index: int, out_dir: Path, speaker: str) -> tu
         sampling_rate=TARGET_SR,
         sample_width=2,
         channels=1,
-        min_dur=MIN_DUR,
-        max_dur=MAX_DUR,
-        max_silence=MAX_SILENCE,
-        energy_threshold=ENERGY_THRESHOLD,
+        min_dur=min_dur,
+        max_dur=max_dur,
+        max_silence=max_silence,
+        energy_threshold=energy_threshold,
     )
 
     n = 0
     total = 0.0
     for region in regions:
         dur = region.end - region.start
-        if dur < MIN_DUR:
+        if dur < min_dur:
             continue
         s0 = int(region.start * TARGET_SR)
         s1 = int(region.end * TARGET_SR)
@@ -109,10 +118,16 @@ def segment_file(src: Path, start_index: int, out_dir: Path, speaker: str) -> tu
     return n, total
 
 
-def process_dataset(dataset_dir: Path):
+def process_dataset(
+    dataset_dir: Path,
+    energy_threshold: float = ENERGY_THRESHOLD,
+    min_dur: float = MIN_DUR,
+    max_dur: float = MAX_DUR,
+    max_silence: float = MAX_SILENCE,
+):
     name = dataset_dir.name
     out_root = PREPROCESSED_ROOT / name
-    print(f"\n=== dataset: {name} ===")
+    print(f"\n=== dataset: {name} (energy_threshold={energy_threshold}) ===")
 
     # group source files by speaker so multiple files per speaker concatenate
     grouped: dict[str, list[Path]] = defaultdict(list)
@@ -134,7 +149,11 @@ def process_dataset(dataset_dir: Path):
         total_clips = 0
         total_speech = 0.0
         for src in sources:
-            n, secs = segment_file(src, total_clips, out_dir, speaker)
+            n, secs = segment_file(
+                src, total_clips, out_dir, speaker,
+                energy_threshold=energy_threshold,
+                min_dur=min_dur, max_dur=max_dur, max_silence=max_silence,
+            )
             total_clips += n
             total_speech += secs
         print(
@@ -147,6 +166,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", help="only process this dataset name (folder under inputs/)")
     ap.add_argument("--inputs-root", default=str(INPUTS_ROOT))
+    ap.add_argument("--energy-threshold", type=float, default=ENERGY_THRESHOLD,
+                    help=f"auditok VAD energy threshold (default {ENERGY_THRESHOLD}; "
+                         "use ~35 for denoised audio with low noise floor)")
+    ap.add_argument("--min-dur", type=float, default=MIN_DUR)
+    ap.add_argument("--max-dur", type=float, default=MAX_DUR)
+    ap.add_argument("--max-silence", type=float, default=MAX_SILENCE)
     args = ap.parse_args()
 
     inputs_root = Path(args.inputs_root)
@@ -165,7 +190,13 @@ def main():
         if not d.is_dir():
             print(f"skip (not a dir): {d}")
             continue
-        process_dataset(d)
+        process_dataset(
+            d,
+            energy_threshold=args.energy_threshold,
+            min_dur=args.min_dur,
+            max_dur=args.max_dur,
+            max_silence=args.max_silence,
+        )
 
 
 if __name__ == "__main__":

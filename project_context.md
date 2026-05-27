@@ -29,16 +29,40 @@ This file serves as a permanent context anchor for developers and AI coding assi
 - **Constraint**: The main `beatrice_trainer`'s VQ codebook builder runs fully in GPU memory at startup. Putting very long audio files (e.g., raw 25-minute recordings) directly into `inputs/` causes immediate **CUDA Out of Memory (OOM)** errors when the network attempts to pass the entire waveform sequence.
 - **Invariant Rule**: Always run `make DATASET=your_dataset preprocess` first. This segments long audio files into clean 4-15 second clips inside `preprocessed/` using `auditok`.
 
+### 2.4 TTS Source Artifacts → Deep-Pitch Buzz
+- **Finding**: Even with balanced regularization, the model faithfully reproduces TTS artifacts (buzz/aliasing) that are baked into the source recordings — especially audible on low-pitch / male voices.
+- **Solution**: Denoise the **source audio** with `denoise_sources.py` (noisereduce, stationary mode, `prop_decrease=0.6`) BEFORE preprocessing. This produces `inputs/<dataset>_denoised/` mirroring the original.
+- **Invariant Rule**: When denoising, always pair with a permissive VAD: `uv run python preprocess.py --dataset <foo>_denoised --energy-threshold 35`. Denoised audio has a lower noise floor and the default threshold (45) over-segments speech.
+
 ---
 
 ## 3. Directory Layout Conventions
 
 - `inputs/<dataset_name>/<speaker_name>/`: Raw source audio files.
+- `inputs/<dataset_name>_denoised/<speaker_name>/`: Denoised source audio (output of `denoise_sources.py`).
 - `preprocessed/<dataset_name>/<speaker_name>/`: Segmented clips outputted by `preprocess.py` (24kHz, mono, PCM_16).
 - `outputs/<dataset_name>/`: Checkpoints and exported paraphernalia voice packages.
 
 ---
 
-## 4. Current Work & Goals
+## 4. Standard Pipeline (Denoised Path)
+
+```bash
+# 1. Denoise source TTS
+uv run python denoise_sources.py --dataset <name>
+
+# 2. Segment with permissive VAD
+uv run python preprocess.py --dataset <name>_denoised --energy-threshold 35
+
+# 3. Train
+uv run python -m beatrice_trainer \
+  -d preprocessed/<name>_denoised \
+  -o outputs/<name>_denoised \
+  -c assets/default_config.json
+```
+
+---
+
+## 5. Current Work & Goals
 - **Active Task**: Fine-tuning Beatrice voice models for `new_lol_data` (6 speakers: sion, teemo, demacia_male, noxus_male, yordle_female, yordle_male).
-- **Setup**: Training is running with the 580k English PhoneExtractor, the V2 VCTK Pitch Estimator, and a robust, balanced regularization config (60,000 steps).
+- **Setup**: Training is running on **denoised** source data with the 580k English PhoneExtractor, the V2 VCTK Pitch Estimator, and a balanced regularization config (60,000 steps).
