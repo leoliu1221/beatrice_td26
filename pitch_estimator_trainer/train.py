@@ -141,6 +141,17 @@ def train(args: argparse.Namespace) -> None:
     wav_length = int(round(args.wav_length_sec * 16000))
     # PitchEstimator's feature extraction requires wav_length % 160 == 0.
     wav_length = (wav_length // 160) * 160
+    # Optional noise-robust mode: when --augment is on, the student sees
+    # noisy audio while the F0 label is still computed from clean audio.
+    # This matches Beatrice's main trainer which feeds augmented audio to
+    # the pitch estimator at training time.
+    noise_files = None
+    ir_files = None
+    if args.augment:
+        from distill_augment import discover_aux_files
+        noise_files = discover_aux_files(args.noise_dir)
+        ir_files = discover_aux_files(args.ir_dir)
+        print(f"noise-robust mode: {len(noise_files)} noise files, {len(ir_files)} IR files")
     dataset = PitchDataset(
         files=files,
         wav_length=wav_length,
@@ -151,6 +162,8 @@ def train(args: argparse.Namespace) -> None:
         f0_ceil=1400.0,
         pitch_bins_per_octave=96,
         seed=args.seed,
+        noise_files=noise_files,
+        ir_files=ir_files,
     )
     loader = DataLoader(
         dataset,
@@ -302,6 +315,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save-interval", type=int, default=2_000)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--augment", action="store_true",
+        help="enable noise-robust training: student sees augmented audio, "
+             "F0 label still computed from clean audio. Closes the train/test "
+             "gap with Beatrice's main trainer.",
+    )
+    p.add_argument("--noise-dir", type=str, default="assets/noise",
+                   help="dir of background noise files (used with --augment)")
+    p.add_argument("--ir-dir", type=str, default="assets/ir",
+                   help="dir of impulse-response files for reverb (used with --augment)")
     return p.parse_args()
 
 

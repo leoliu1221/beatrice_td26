@@ -19,6 +19,7 @@ dependencies = [
     "auditok>=0.3",
     "setuptools<81", # tensorboard 2.20 still imports pkg_resources (removed in setuptools 81+)
     "noisereduce>=3.0.3",
+    "deepfilternet>=0.5.6",
 ]
 
 [project.optional-dependencies]

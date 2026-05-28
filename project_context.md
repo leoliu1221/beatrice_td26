@@ -29,35 +29,59 @@ This file serves as a permanent context anchor for developers and AI coding assi
 - **Constraint**: The main `beatrice_trainer`'s VQ codebook builder runs fully in GPU memory at startup. Putting very long audio files (e.g., raw 25-minute recordings) directly into `inputs/` causes immediate **CUDA Out of Memory (OOM)** errors when the network attempts to pass the entire waveform sequence.
 - **Invariant Rule**: Always run `make DATASET=your_dataset preprocess` first. This segments long audio files into clean 4-15 second clips inside `preprocessed/` using `auditok`.
 
+### 2.5 Feature Extractors Must Be Trained With the Same Augmentation As Beatrice
+- **Failure mode**: Beatrice's main trainer calls `augment_audio()` (noise, reverb, LPF, formant shift) on the input wav before passing it to PhoneExtractor and PitchEstimator. If those extractors were distilled on **clean** audio only, they produce unstable features under augmentation, and the main converter learns to reproduce that instability as noise during conversion.
+- **Symptom**: "Noise when I talk" — the converted audio has artifacts overlaid on the user's speech even with a clean denoised dataset.
+- **Fix**: train the extractors with the same `augment_audio()` pipeline. Student sees noisy input, target (HuBERT features / pyworld F0) is computed from clean input. This is noise-robust / consistency distillation.
+- **How to invoke**:
+  ```bash
+  # Phone extractor: resume from previous checkpoint, target +200k noise-robust steps
+  make phone-train RESUME=1 AUGMENT=1 PHONE_STEPS=780000
+  make phone-export
+
+  # Pitch estimator: same idea
+  make pitch-train RESUME=1 AUGMENT=1 PITCH_STEPS=500000
+  make pitch-export
+  ```
+- **Files involved**: `distill_augment.py`, `phone_extractor_trainer/{data,train}.py`, `pitch_estimator_trainer/{data,train}.py`, Makefile (`AUGMENT=1` toggle).
+- **Pitch caveat**: in `PitchDataset` the formant shift probability is force-set to 0 because Beatrice's formant shift uses spectral-envelope warp + resample, which can perturb pyworld F0 labels and silently corrupt training. All other augmentations (noise/reverb/LPF) are kept.
+
 ### 2.4 TTS Source Artifacts → Deep-Pitch Buzz
 - **Finding**: Even with balanced regularization, the model faithfully reproduces TTS artifacts (buzz/aliasing) that are baked into the source recordings — especially audible on low-pitch / male voices.
-- **Solution**: Denoise the **source audio** with `denoise_sources.py` (noisereduce, stationary mode, `prop_decrease=0.6`) BEFORE preprocessing. This produces `inputs/<dataset>_denoised/` mirroring the original.
-- **Invariant Rule**: When denoising, always pair with a permissive VAD: `uv run python preprocess.py --dataset <foo>_denoised --energy-threshold 35`. Denoised audio has a lower noise floor and the default threshold (45) over-segments speech.
+- **Two denoiser options** (use either, not both):
+  - `denoise_sources.py` (noisereduce, spectral subtraction). Quick, no deps. Good for stationary background hum. **Misses phoneme-correlated artifacts.**
+  - `denoise_sources_df.py` (**DeepFilterNet3**, deep learning). Requires Rust toolchain. Handles non-stationary buzz / vocoder ringing / transients. **Preferred for TTS sources.**
+- **Invariant Rule**: When denoising, always pair with a permissive VAD: `uv run python preprocess.py --dataset <foo>_df --energy-threshold 35`. Denoised audio has a lower noise floor and the default threshold (45) over-segments speech.
+- **DeepFilterNet gotchas**:
+  - Needs Rust: `curl https://sh.rustup.rs ... | sh -s -- -y && source $HOME/.cargo/env`
+  - Long files crash cuDNN GRU — script chunks audio at 30s.
+  - Downgrades numpy to 1.26 as a transitive dep; Beatrice still imports OK.
 
 ---
 
 ## 3. Directory Layout Conventions
 
 - `inputs/<dataset_name>/<speaker_name>/`: Raw source audio files.
-- `inputs/<dataset_name>_denoised/<speaker_name>/`: Denoised source audio (output of `denoise_sources.py`).
+- `inputs/<dataset_name>_denoised/<speaker_name>/`: Source audio denoised with noisereduce.
+- `inputs/<dataset_name>_df/<speaker_name>/`: Source audio denoised with DeepFilterNet3.
 - `preprocessed/<dataset_name>/<speaker_name>/`: Segmented clips outputted by `preprocess.py` (24kHz, mono, PCM_16).
 - `outputs/<dataset_name>/`: Checkpoints and exported paraphernalia voice packages.
 
 ---
 
-## 4. Standard Pipeline (Denoised Path)
+## 4. Standard Pipeline (DeepFilterNet Path, Preferred)
 
 ```bash
-# 1. Denoise source TTS
-uv run python denoise_sources.py --dataset <name>
+# 1. Denoise source TTS with DeepFilterNet3 (handles non-stationary artifacts)
+uv run python denoise_sources_df.py --dataset <name>
 
 # 2. Segment with permissive VAD
-uv run python preprocess.py --dataset <name>_denoised --energy-threshold 35
+uv run python preprocess.py --dataset <name>_df --energy-threshold 35
 
 # 3. Train
 uv run python -m beatrice_trainer \
-  -d preprocessed/<name>_denoised \
-  -o outputs/<name>_denoised \
+  -d preprocessed/<name>_df \
+  -o outputs/<name>_df \
   -c assets/default_config.json
 ```
 

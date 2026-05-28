@@ -143,12 +143,27 @@ def train(args: argparse.Namespace) -> None:
     wav_length = int(round(args.wav_length_sec * 16000))
     # PhoneExtractor's FeatureExtractor requires wav_length % 160 == 0.
     wav_length = (wav_length // 160) * 160
+    # Optional noise-robust distillation mode: when --augment is on, the
+    # student sees augmented audio (noise+reverb+LPF+formant shift) while the
+    # teacher still sees clean audio. This closes the train/test gap with
+    # Beatrice's main trainer which always feeds augmented audio to the
+    # phone extractor at training time.
+    noise_files = None
+    ir_files = None
+    if args.augment:
+        from distill_augment import discover_aux_files
+        noise_files = discover_aux_files(args.noise_dir)
+        ir_files = discover_aux_files(args.ir_dir)
+        print(f"noise-robust mode: {len(noise_files)} noise files, {len(ir_files)} IR files")
+
     dataset = WavCropDataset(
         files=files,
         wav_length=wav_length,
         samples_per_epoch=args.batch_size * args.steps_per_epoch,
         sample_rate=16000,
         seed=args.seed,
+        noise_files=noise_files,
+        ir_files=ir_files,
     )
     loader = DataLoader(
         dataset,
@@ -200,10 +215,17 @@ def train(args: argparse.Namespace) -> None:
     t_start = time.time()
     pbar = tqdm(total=args.steps, initial=step, desc="distill", dynamic_ncols=True)
     while step < args.steps:
-        for wav in loader:
+        for batch in loader:
             if step >= args.steps:
                 break
-            wav = wav.to(device, non_blocking=True)  # [B, wav_length]
+            # Noise-robust mode yields (clean, noisy); plain mode yields wav.
+            if isinstance(batch, (tuple, list)) and len(batch) == 2:
+                clean_wav, student_input = batch
+                clean_wav = clean_wav.to(device, non_blocking=True)
+                student_input = student_input.to(device, non_blocking=True)
+            else:
+                clean_wav = batch.to(device, non_blocking=True)
+                student_input = clean_wav
 
             # update LR
             lr = cosine_warmup_lr(step, args.warmup_steps, args.steps, args.lr, args.min_lr)
@@ -211,11 +233,13 @@ def train(args: argparse.Namespace) -> None:
                 g["lr"] = lr
 
             with torch.amp.autocast("cuda", enabled=scaler.is_enabled()):
-                # Teacher in fp32 (HuBERT is small enough; keeps targets stable)
+                # Teacher always sees CLEAN audio in fp32 (HuBERT is small
+                # enough; keeps targets stable).
                 with torch.amp.autocast("cuda", enabled=False):
-                    teacher_feat = teacher(wav.float())  # [B, T_t, 768]
-                # Student: [B, 1, wav_length] -> [B, 128, T_s]
-                student_feat = student(wav.unsqueeze(1), return_stats=False)
+                    teacher_feat = teacher(clean_wav.float())  # [B, T_t, 768]
+                # Student sees augmented input when noise-robust mode is on,
+                # or the same clean wav otherwise. [B, 1, wav_length] -> [B, 128, T_s]
+                student_feat = student(student_input.unsqueeze(1), return_stats=False)
                 student_feat = student_feat.transpose(1, 2)  # [B, T_s, 128]
                 student_proj = projection(student_feat)       # [B, T_s, 768]
                 loss, stats = distillation_loss(
@@ -306,6 +330,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save-interval", type=int, default=2_000)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--augment", action="store_true",
+        help="enable noise-robust distillation: student sees augmented audio, "
+             "teacher sees clean. Closes the train/test gap with Beatrice.",
+    )
+    p.add_argument("--noise-dir", type=str, default="assets/noise",
+                   help="dir of background noise files (used with --augment)")
+    p.add_argument("--ir-dir", type=str, default="assets/ir",
+                   help="dir of impulse-response files for reverb (used with --augment)")
     return p.parse_args()
 
 

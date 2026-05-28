@@ -57,6 +57,9 @@ PHONE_WORKERS ?= 4
 PHONE_EXPORT_OUT ?= assets/pretrained/phone_extractor_en.pt
 PHONE_INIT_FLAG := $(if $(PHONE_INIT),--init-from $(PHONE_INIT),)
 PHONE_RESUME_FLAG := $(if $(RESUME),--resume,)
+# AUGMENT=1 enables noise-robust distillation: student sees augment_audio()-corrupted
+# audio, teacher sees clean. Closes the train/test gap with Beatrice's main trainer.
+PHONE_AUGMENT_FLAG := $(if $(AUGMENT),--augment,)
 
 # PitchEstimator trainer variables
 VCTK_ROOT     := datasets/vctk
@@ -70,6 +73,9 @@ PITCH_WORKERS ?= 8
 PITCH_EXPORT_OUT ?= assets/pretrained/pitch_estimator_v2.pt
 PITCH_INIT_FLAG := $(if $(PITCH_INIT),--init-from $(PITCH_INIT),)
 PITCH_RESUME_FLAG := $(if $(RESUME),--resume,)
+# AUGMENT=1 enables noise-robust training: student sees augmented audio,
+# F0 label is still computed from clean audio.
+PITCH_AUGMENT_FLAG := $(if $(AUGMENT),--augment,)
 
 .PHONY: all preprocess config train resume tensorboard clean help \
         phone-data-download phone-train phone-train-en phone-export phone-tensorboard \
@@ -126,7 +132,8 @@ phone-train:
 		--batch-size $(PHONE_BATCH) \
 		--num-workers $(PHONE_WORKERS) \
 		$(PHONE_INIT_FLAG) \
-		$(PHONE_RESUME_FLAG)
+		$(PHONE_RESUME_FLAG) \
+		$(PHONE_AUGMENT_FLAG)
 
 phone-train-en: phone-data-download
 	$(MAKE) phone-train
@@ -180,7 +187,8 @@ pitch-train:
 		--batch-size $(PITCH_BATCH) \
 		--num-workers $(PITCH_WORKERS) \
 		$(PITCH_INIT_FLAG) \
-		$(PITCH_RESUME_FLAG)
+		$(PITCH_RESUME_FLAG) \
+		$(PITCH_AUGMENT_FLAG)
 
 pitch-train-vctk: pitch-data-download pitch-preprocess
 	$(MAKE) pitch-train

@@ -8,10 +8,20 @@ For best results, use diverse pitch data:
 - Male and female speakers across age ranges
 - Singing voice datasets (VocalSet, NUS-48E, etc.)
 - Speech datasets with varied pitch ranges
+
+Noise-robust mode
+-----------------
+When `noise_files` and `ir_files` are passed, each yielded waveform is
+augmented with Beatrice's `augment_audio()` (noise + reverb + LPF + formant
+shift) while the F0 label is still computed from the **clean** waveform.
+This teaches the estimator to predict pitch from corrupted audio, closing
+the train/test gap with Beatrice's main trainer (which always feeds the
+estimator noisy audio).
 """
 from __future__ import annotations
 
 import random
+import sys
 from pathlib import Path
 from typing import Sequence
 
@@ -22,6 +32,11 @@ import torchaudio
 from torch.utils.data import Dataset
 
 AUDIO_EXTS = {".wav", ".flac", ".mp3", ".ogg", ".m4a", ".aac", ".opus"}
+
+# Make distill_augment importable from worker processes.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 # Cache per-process resamplers (one per source sample rate) to avoid rebuilding
 # the kernel on every __getitem__ call.
@@ -120,6 +135,9 @@ class PitchDataset(Dataset):
         f0_ceil: float = 1400.0,
         pitch_bins_per_octave: int = 96,
         seed: int | None = None,
+        noise_files: Sequence[Path] | None = None,
+        ir_files: Sequence[Path] | None = None,
+        aug_kwargs: dict | None = None,
     ):
         if wav_length <= 0:
             raise ValueError("wav_length must be positive")
@@ -134,6 +152,22 @@ class PitchDataset(Dataset):
         self.f0_ceil = f0_ceil
         self.pitch_bins_per_octave = pitch_bins_per_octave
         self._rng = random.Random(seed)
+        # Noise-robust mode: when set, the returned waveform is augmented while
+        # the F0 label is still computed from the clean wav. We default
+        # formant_shift_probability to 0 because formant shifts can subtly
+        # alter pyworld's F0 estimate (the `random_formant_shift` in Beatrice
+        # is a spectral-envelope-warp + resample combo, not pure LPC), which
+        # would silently corrupt the labels. The other Beatrice augmentations
+        # (noise/reverb/LPF) leave F0 untouched.
+        if (noise_files is None) != (ir_files is None):
+            raise ValueError("noise_files and ir_files must be both set or both None")
+        self.noise_files = list(noise_files) if noise_files is not None else None
+        self.ir_files = list(ir_files) if ir_files is not None else None
+        merged_aug = {"formant_shift_probability": 0.0}
+        if aug_kwargs:
+            merged_aug.update(aug_kwargs)
+        self.aug_kwargs = merged_aug
+        self.augment_enabled = self.noise_files is not None
 
     def __len__(self) -> int:
         return self.samples_per_epoch
@@ -222,13 +256,30 @@ class PitchDataset(Dataset):
         return wav, torch.from_numpy(pitch_bins).long()
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        # Try a few times in case a file is corrupt/unreadable.
+        """Returns (wav, pitch_bins). In noise-robust mode `wav` is augmented
+        but `pitch_bins` are computed from the clean source."""
         last_err: Exception | None = None
         for _ in range(8):
             path = self._rng.choice(self.files)
             try:
-                return self._load_random_crop(path)
+                clean_wav, pitch_bins = self._load_random_crop(path)
             except Exception as e:  # noqa: BLE001
                 last_err = e
                 continue
+            if not self.augment_enabled:
+                return clean_wav, pitch_bins
+            # Apply Beatrice's augment_audio to a clone; keep clean pitch_bins.
+            from distill_augment import apply_augmentation
+
+            try:
+                noisy_wav = apply_augmentation(
+                    clean_wav.detach().clone(),
+                    self.noise_files,
+                    self.ir_files,
+                    self.aug_kwargs,
+                )
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                noisy_wav = clean_wav.detach().clone()
+            return noisy_wav, pitch_bins
         raise RuntimeError(f"could not load any audio after 8 tries; last error: {last_err}")
