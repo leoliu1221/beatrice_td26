@@ -25,18 +25,97 @@ A running log of experiments, hyperparameter tuning, data scaling, and model beh
 - Both trainers now expose `--augment`, `--noise-dir`, `--ir-dir` CLI flags.
 - Makefile gained `AUGMENT=1` toggle: `make phone-train RESUME=1 AUGMENT=1 PHONE_STEPS=780000` and the equivalent for pitch.
 
-### Run 4.1: PhoneExtractor noise-robust resume (running)
+### Run 4.1: PhoneExtractor noise-robust resume (ABORTED at step 704k)
 - Resume from `outputs/phone_extractor_en/checkpoint_latest.pt` (step 580,000).
 - Target: 780,000 steps (+200k noise-robust fine-tuning steps).
 - LR resumes mid-cosine-decay at ~8e-5.
-- **Initial step 580k loss jumped from 0.22 → 0.27, cos_sim dropped 0.78 → 0.73** — expected; the network now has to extract phones from noisy/reverbed audio.
-- Throughput: ~6 it/s → ~9 h ETA.
-- **Result**: **In Progress**.
+- **Initial step 580k loss jumped from 0.22 → 0.27, cos_sim dropped 0.78 → 0.73** — expected; the network had to start extracting phones from noisy/reverbed audio.
+- **At step 702k**: train/loss → 0.24, train/cos_sim → 0.76 (looked healthy in TensorBoard).
 
-### Run 4.2: PitchEstimator noise-robust resume (pending)
-- Resume from `outputs/pitch_estimator_v2/checkpoint_latest.pt` (step 300,000).
-- Target: 500,000 steps (+200k noise-robust steps).
-- Scheduled to start after Run 4.1 completes (single GPU box).
+#### Eval at step 704k (new `phone_extractor_trainer/eval.py`, n=64 per condition)
+Held-out cos_sim comparing the student's projected features to the HuBERT teacher across four conditions:
+
+| Condition | Step 580k (pre-aug) | Step 704k (aug-trained) | Δ |
+|---|---|---|---|
+| (a) Clean LibriSpeech (sanity) | 0.7828 | 0.7820 | ≈ 0 |
+| (b) Aug LibriSpeech (~train) | 0.7421 | 0.7446 | +0.003 |
+| (c) Clean target (LoL) | 0.7095 | 0.6987 | **−0.011** |
+| (d) Aug target (LoL) | 0.6549 | 0.6380 | **−0.017** |
+
+- Train metric improved 0.73 → 0.76 (+0.03) but held-out (b) only +0.003 → **classic mild-overfit signature** (train improving 10× faster than held-out).
+- Target-domain (c, d) actually **regressed** ~1-2%. Within noise (1-3 SEs) but the trend is wrong.
+- **Diagnosis**: the student is specializing to the LibriSpeech-with-augmentation distribution but **not transferring noise-invariance to the LoL TTS acoustics**. Augmentation alone is insufficient when there is also a domain gap between training audio (natural speech) and target audio (synthetic TTS).
+- **Action**: aborted at 704k, restored `checkpoint_latest.pt` to the 580k snapshot, launched a new run with **target-domain mixing**.
+
+### Run 4.1b: PhoneExtractor with augmentation + target-domain mix (ABORTED)
+- Implementation: `WavCropDataset` gained `aux_files` + `aux_mix_ratio`; each `__getitem__` call picks from the aux pool with probability `aux_mix_ratio`, otherwise from the main LibriSpeech pool. New CLI: `--target-data-dir`, `--target-mix-ratio`.
+- Resumed from restored 580k checkpoint with mix ratio 0.3.
+- Aborted after ~2k steps when the full step-by-step eval sweep revealed the 580k checkpoint was already past the target-domain peak (see below). No point continuing from a degraded local minimum.
+
+### Full eval sweep across all existing checkpoints (decisive finding)
+Built `phone_extractor_trainer/eval.py` and `phone_extractor_trainer/eval_sweep.py` (sharing `build_eval_context` and `eval_checkpoint`). Swept every 50k steps from 10k → 700k, then a fine sweep every 10k from 150k → 280k (n=64).
+
+Best target-domain cos_sim by checkpoint:
+
+| step | (a) clean LS | (b) aug LS | (c) clean target | (d) aug target |
+|---|---|---|---|---|
+| 100k | 0.7719 | 0.7290 | 0.7095 | 0.6620 |
+| 180k | 0.7829 | 0.7438 | **0.7180** ← best | 0.6667 |
+| **200k** | **0.7833** | **0.7441** | 0.7177 | **0.6674** ← best |
+| 210k | 0.7713 | 0.7356 | 0.7056 | 0.6559 | ← run boundary, sharp drop |
+| 300k | 0.7746 | 0.7267 | 0.7057 | 0.6548 |
+| 580k (used) | 0.7828 | 0.7421 | 0.7095 | 0.6549 |
+| 700k (post-aug) | 0.7812 | 0.7380 | 0.6954 | 0.6330 |
+
+- **Target-domain (c, d) peaked at step 180-200k**, then slowly declined for the next 380k steps even as in-domain (a, b) kept inching up. Classic train/test divergence.
+- **A run-boundary discontinuity at step 210k** dropped all four metrics by ~1%; never fully recovered.
+- **The 580k "production" checkpoint is ~0.010 below the 200k peak on target domain.**
+- The 580k → 700k noise-robust resume made target performance markedly worse (~3.5% absolute drop on clean target). Augmentation alone cannot un-do existing LibriSpeech-specific specialization.
+- **Cos_sim is a proxy**: per Experiment 2's listening tests, the 200k checkpoint produced "muffled, slurred" Beatrice output. So cos_sim-best ≠ downstream-best. We'll need to A/B them in Beatrice.
+
+Fallback exported: `assets/pretrained/phone_extractor_en_200k.pt`.
+
+### Run 4.1c: PhoneExtractor distilled from scratch with augmentation + target-mix (running)
+- Hypothesis: rather than fine-tuning a clean-overfit 580k checkpoint, train noise-robustly **from the start** so noise-invariance is a primary objective and the LibriSpeech specialization doesn't form in the first place.
+- Output dir: `outputs/phone_extractor_en_v2/` (preserves the existing v1 checkpoints).
+- Config: warm-start from the original Japanese checkpoint `122_checkpoint_03000000.pt` (same as v1, for apples-to-apples), `--augment`, `--target-data-dir preprocessed/new_lol_data_df --target-mix-ratio 0.2`, 300k total steps, batch 32, 4 workers.
+- Throughput ~4.6 it/s, ETA ~18 h.
+- **Eval plan**: sweep `outputs/phone_extractor_en_v2/checkpoint_*.pt` every 25k steps. Decisive metric: target-domain (c, d) must beat the v1 200k peak (0.7177 / 0.6674) to justify the new recipe.
+- **Status**: **In Progress (mid-sweep result decisive, see below)**.
+
+#### Eval sweep at step 250k (n=64, target=`preprocessed/new_lol_data_df`)
+
+| step | (a) clean LS | (b) aug LS | (c) clean target | (d) aug target |
+|---:|---:|---:|---:|---:|
+| 50,000 | 0.7496 | 0.7217 | 0.8151 | 0.7605 |
+| 100,000 | 0.7552 | 0.7237 | 0.8248 | 0.7679 |
+| 150,000 | 0.7612 | 0.7287 | 0.8298 | 0.7705 |
+| 200,000 | 0.7648 | 0.7313 | 0.8347 | 0.7745 |
+| **250,000** | **0.7685** | **0.7344** | **0.8379** | **0.7763** |
+
+Comparison to v1 best target-domain checkpoint (200k) and v1 production (580k):
+
+| metric | v1 200k | v1 580k | **v2 250k** | Δ v2 vs v1 200k |
+|---|---:|---:|---:|---:|
+| (a) clean LS | 0.7833 | 0.7828 | 0.7685 | −0.015 |
+| (b) aug LS | 0.7441 | 0.7421 | 0.7344 | −0.010 |
+| (c) clean target | 0.7177 | 0.7095 | **0.8379** | **+0.120** |
+| (d) aug target | 0.6674 | 0.6549 | **0.7763** | **+0.109** |
+
+- **Hypothesis validated.** Trading away ~1.5% in-domain LibriSpeech cos_sim buys **+12% on the actual target distribution**. Confirms that v1's LibriSpeech specialization was the dominant failure mode, not noise-augmentation per se.
+- **Monotonic improvement** 50k → 250k on all four conditions: no overfit signature yet, no train/test divergence. Letting training continue to the planned 300k steps.
+- The (c) > (a) ordering is initially counterintuitive but expected: the target pool is preprocessed, denoised LoL clips (clean, narrow speaker set), while the LibriSpeech eval pool is the raw open-domain LS distribution. Cos_sim is higher on the simpler distribution.
+- **Note**: target-mix 0.2 means 20% of training batches were sampled from `new_lol_data_df`, so (c)/(d) are *not* held-out in the strict sense. They measure "target-domain fit" rather than zero-shot generalization. Still strictly more honest than v1, which had zero target exposure.
+
+### Run 4.2: PitchEstimator noise-robust resume (DEFERRED)
+- Held until Run 4.1c picks a winning phone extractor checkpoint. No point retraining the pitch estimator while the phone recipe is being iterated.
+
+### Run 4.3: Beatrice re-train with noise-robust extractors (pending)
+- After Runs 4.1b + 4.2 complete and export, retrain Beatrice on `preprocessed/new_lol_data_df`. Same balanced regularization as Phase B/C/D.
+
+### Key insight: held-out eval is mandatory for distillation
+- Train metrics can show steady improvement while the student is mildly overfitting. We only caught Run 4.1's specialization by running `phone_extractor_trainer/eval.py` with four conditions (clean/aug × in-domain/target-domain).
+- **Invariant rule going forward**: any change to the distillation recipe must be evaluated against the 580k baseline on all four conditions before being adopted.
 
 ---
 

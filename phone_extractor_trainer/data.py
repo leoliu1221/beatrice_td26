@@ -78,6 +78,8 @@ class WavCropDataset(Dataset):
         noise_files: Sequence[Path] | None = None,
         ir_files: Sequence[Path] | None = None,
         aug_kwargs: dict | None = None,
+        aux_files: Sequence[Path] | None = None,
+        aux_mix_ratio: float = 0.0,
     ):
         if wav_length <= 0:
             raise ValueError("wav_length must be positive")
@@ -95,6 +97,15 @@ class WavCropDataset(Dataset):
         self.ir_files = list(ir_files) if ir_files is not None else None
         self.aug_kwargs = aug_kwargs
         self.augment_enabled = self.noise_files is not None
+        # Auxiliary (target-domain) pool: on each __getitem__ call we sample
+        # from `aux_files` with probability `aux_mix_ratio`, else from `files`.
+        # Used to expose the student to the actual inference distribution
+        # (e.g., the LoL TTS voices) during distillation, fighting the
+        # LibriSpeech-only specialization seen at step 580k -> 704k.
+        if aux_files is not None and not 0.0 <= aux_mix_ratio <= 1.0:
+            raise ValueError("aux_mix_ratio must be in [0, 1]")
+        self.aux_files = list(aux_files) if aux_files else None
+        self.aux_mix_ratio = aux_mix_ratio if self.aux_files else 0.0
 
     def __len__(self) -> int:
         return self.samples_per_epoch
@@ -130,7 +141,11 @@ class WavCropDataset(Dataset):
         # Try a few times in case a file is corrupt/unreadable.
         last_err: Exception | None = None
         for _ in range(8):
-            path = self._rng.choice(self.files)
+            # Weighted choice between the main pool and the (optional) aux pool.
+            if self.aux_files and self._rng.random() < self.aux_mix_ratio:
+                path = self._rng.choice(self.aux_files)
+            else:
+                path = self._rng.choice(self.files)
             try:
                 clean = self._load_random_crop(path)
             except Exception as e:  # noqa: BLE001

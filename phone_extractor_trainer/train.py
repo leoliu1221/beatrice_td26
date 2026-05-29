@@ -156,6 +156,15 @@ def train(args: argparse.Namespace) -> None:
         ir_files = discover_aux_files(args.ir_dir)
         print(f"noise-robust mode: {len(noise_files)} noise files, {len(ir_files)} IR files")
 
+    # Optional target-domain mixing: on each batch sample, pick from
+    # --target-data-dir with probability --target-mix-ratio. Exposes the
+    # student to the actual inference distribution (e.g., LoL TTS voices)
+    # so it does not over-specialize to LibriSpeech acoustics.
+    aux_files = None
+    if args.target_data_dir:
+        aux_files = discover_audio_files(Path(args.target_data_dir))
+        print(f"target-domain mix: {len(aux_files)} files, ratio={args.target_mix_ratio}")
+
     dataset = WavCropDataset(
         files=files,
         wav_length=wav_length,
@@ -164,6 +173,8 @@ def train(args: argparse.Namespace) -> None:
         seed=args.seed,
         noise_files=noise_files,
         ir_files=ir_files,
+        aux_files=aux_files,
+        aux_mix_ratio=args.target_mix_ratio,
     )
     loader = DataLoader(
         dataset,
@@ -339,6 +350,10 @@ def parse_args() -> argparse.Namespace:
                    help="dir of background noise files (used with --augment)")
     p.add_argument("--ir-dir", type=str, default="assets/ir",
                    help="dir of impulse-response files for reverb (used with --augment)")
+    p.add_argument("--target-data-dir", type=str, default="",
+                   help="optional target-domain audio dir to mix in during training")
+    p.add_argument("--target-mix-ratio", type=float, default=0.0,
+                   help="probability of sampling from --target-data-dir each step (0..1)")
     return p.parse_args()
 
 
