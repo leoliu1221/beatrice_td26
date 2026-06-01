@@ -920,7 +920,7 @@ class FeatureExtractor(nn.Module):
         # x: [batch_size, 1, wav_length]
         wav_length = x.size(2)
         if wav_length % 160 != 0:
-            warnings.warn("wav_length % 160 != 0")
+            x = F.pad(x, (0, 160 - wav_length % 160))
         x = F.pad(x, (40, 40))
         x = F.gelu(self.conv0(x), approximate="tanh")
         x = F.gelu(self.conv1(x), approximate="tanh")
