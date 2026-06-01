@@ -1,0 +1,17 @@
+{
+  "module": "pitch_estimator",
+  "tag": "vctk_clean_300k",
+  "kind": "trained",
+  "exported_from": "outputs/pitch_estimator_v2_old_1780100502/checkpoint_00300000.pt",
+  "exported_at": "approx 2026-05",
+  "recipe": {
+    "init_from": "assets/pretrained/pitch_estimator/jp_104_3_300k.pt",
+    "dataset": "datasets/vctk/VCTK-Corpus-0.92/wav48_silence_trimmed",
+    "augment": false,
+    "steps": 300000,
+    "batch_size": 256
+  },
+  "deprecated": true,
+  "superseded_by": "pitch_estimator/vctk_nr_300k.pt",
+  "notes": "Original clean-only VCTK pitch estimator. Kept as a baseline for ablation against the noise-robust version. Was previously published under the filename pitch_estimator_v2.pt."
+}

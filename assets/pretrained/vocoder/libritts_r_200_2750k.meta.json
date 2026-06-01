@@ -1,0 +1,9 @@
+{
+  "module": "vocoder",
+  "tag": "libritts_r_200_2750k",
+  "kind": "upstream",
+  "exported_from": "Beatrice upstream release",
+  "original_filename": "151_checkpoint_libritts_r_200_02750000.pt.gz",
+  "recipe": {"notes": "Pretrained vocoder (LibriTTS-R, 2.75M steps). Loaded as warm-start for the converter network in beatrice_trainer."},
+  "notes": "Do not delete. Referenced as `pretrained_file` in default_config.json."
+}

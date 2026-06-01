@@ -112,12 +112,12 @@ dict_default_hparams = {
     "augmentation_lpf_probability": 0.2,
     "augmentation_lpf_cutoff_freq_candidates": [2000.0, 3000.0, 4000.0, 6000.0],
     # data
-    "phone_extractor_file": "assets/pretrained/phone_extractor_en.pt",
-    "pitch_estimator_file": "assets/pretrained/pitch_estimator_v2.pt",
+    "phone_extractor_file": "assets/pretrained/phone_extractor/current.pt",
+    "pitch_estimator_file": "assets/pretrained/pitch_estimator/current.pt",
     "in_ir_wav_dir": "assets/ir",
     "in_noise_wav_dir": "assets/noise",
     "in_test_wav_dir": "assets/test",
-    "pretrained_file": "assets/pretrained/151_checkpoint_libritts_r_200_02750000.pt.gz",  # None も可
+    "pretrained_file": "assets/pretrained/vocoder/current.pt.gz",  # None も可
     # model
     "pitch_bins": 448,  # 変更不可
     "hidden_channels": 256,  # ファインチューン時変更不可、変更した場合は推論側の対応必要

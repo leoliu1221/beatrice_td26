@@ -107,11 +107,51 @@ Comparison to v1 best target-domain checkpoint (200k) and v1 production (580k):
 - The (c) > (a) ordering is initially counterintuitive but expected: the target pool is preprocessed, denoised LoL clips (clean, narrow speaker set), while the LibriSpeech eval pool is the raw open-domain LS distribution. Cos_sim is higher on the simpler distribution.
 - **Note**: target-mix 0.2 means 20% of training batches were sampled from `new_lol_data_df`, so (c)/(d) are *not* held-out in the strict sense. They measure "target-domain fit" rather than zero-shot generalization. Still strictly more honest than v1, which had zero target exposure.
 
-### Run 4.2: PitchEstimator noise-robust resume (DEFERRED)
-- Held until Run 4.1c picks a winning phone extractor checkpoint. No point retraining the pitch estimator while the phone recipe is being iterated.
+### Run 4.1c final: PhoneExtractor v2 converged
+- Training completed all 300k steps (run resumed from step 262k after a terminal-closure interruption at 260k).
+- Final eval sweep (every 10k from 200k → 300k, n=64):
 
-### Run 4.3: Beatrice re-train with noise-robust extractors (pending)
-- After Runs 4.1b + 4.2 complete and export, retrain Beatrice on `preprocessed/new_lol_data_df`. Same balanced regularization as Phase B/C/D.
+| step | (a) clean LS | (b) aug LS | (c) clean target | (d) aug target |
+|---:|---:|---:|---:|---:|
+| 250,000 | 0.7685 | 0.7387 | 0.8379 | 0.7746 |
+| 270,000 | 0.7690 | 0.7391 | 0.8388 | 0.7756 |
+| 290,000 | 0.7690 | 0.7388 | 0.8390 | 0.7756 |
+| **300,000** | **0.7692** | 0.7388 | **0.8390** | 0.7755 |
+
+- All four metrics flatlined from ~270k onward — clean convergence, **no overfit signature** (no metric regression in last 30k).
+- **Exported** `outputs/phone_extractor_en_v2/checkpoint_00300000.pt` → `assets/pretrained/phone_extractor_en_v2.pt` (14 MB, load_state_dict clean).
+- v1 production was 580k @ (c)=0.7095 / (d)=0.6549. v2 wins by **+0.130 / +0.121** on target domain. The −0.014 in-domain drop is a reasonable price.
+- **Status**: ✅ **DONE**.
+
+### Run 4.2: PitchEstimator v2 from-scratch noise-robust training (running)
+- **Recipe**: VCTK, warm-start from `assets/pretrained/104_3_checkpoint_00300000.pt`, 300k steps, batch 256, 8 workers, `--augment` (no target-mix — F0 supervision is universal across natural speech; VCTK already covers 109 speakers across both sexes).
+- **Why no target-mix**: pyworld F0 is a ground-truth label, not a learned target distribution. The student only needs noise-invariance, not target-domain phonetic specialization. Phone extractor needed target-mix because HuBERT features are continuous representations that *do* drift across domains.
+- **Why from scratch (not resume)**: same logic as Run 4.1c — fine-tuning a clean-distilled checkpoint with augmentation likely leaves residual clean-specialization. Better to make noise-invariance a primary objective from step 0.
+- **Setup**: archived previous clean-only `outputs/pitch_estimator_v2` → `outputs/pitch_estimator_v2_old_<ts>`. Output dir reused so `pitch-export` Makefile target still works without flag changes.
+- **Caveat (already in code)**: `formant_shift_probability` is force-set to 0 in `PitchDataset` because Beatrice's formant shift uses spectral-envelope warp + resample which can perturb pyworld F0 labels.
+- Throughput stabilizing at ~3.4 it/s after dataloader warmup. ETA ~25h.
+- **Eval plan**: no dedicated eval script (yet); will monitor `train/acc` (target ≥0.70, started at 0.70 due to warm-start) and `train/err_semitones` (target ≤2 st). If those plateau cleanly, export `checkpoint_00300000.pt` → `assets/pretrained/pitch_estimator_v2.pt`.
+- **Status**: 🔄 **In Progress**.
+
+### Run 4.2 final: PitchEstimator v2 done
+- VCTK noise-robust training reached step 300k. Exported `outputs/pitch_estimator_v2/checkpoint_00300000.pt` → `assets/pretrained/pitch_estimator_v2.pt` (6.7 MB, clean load).
+- (No dedicated held-out eval script for the pitch estimator yet; relied on `train/acc` and `train/err_semitones` plateauing cleanly.)
+- **Status**: ✅ **DONE**.
+
+### Run 4.3: Beatrice A/B on `grad_weight_ap` (running)
+- **Context**: upstream merged PR #1 ("trainer progress reporting and throughput tuning") which, among other things, **flipped the default of `grad_weight_ap` from 100.0 → 0.0**. `loss_ap` is the D4C-based aperiodicity reconstruction loss that supervises the vocoder's aperiodicity branch (noise excitation for unvoiced consonants and breathy components). It conditions on the model's predicted F0; if F0 is wrong, the supervision is corrupted.
+- **Hypothesis**: with a freshly retrained pitch estimator (Run 4.2) whose F0 outputs may differ from the original Japanese-leaning baseline, the D4C-based supervision could be either a net positive (more accurate F0 → better aperiodicity targets) or a net negative (slight F0 errors propagated into a 100×-weighted loss → buzz on deep voices). The upstream PR's flip to 0 suggests the latter at least sometimes. We A/B both to find out.
+- **Setup**: two configs identical except for `grad_weight_ap`:
+  - `assets/configs/ab_ap0_v2.json` — upstream default.
+  - `assets/configs/ab_ap100_v2.json` — legacy weight.
+  - Both use `phone_extractor_en_v2.pt` + `pitch_estimator_v2.pt`, balanced regularization (Phase B/C/D config), 60k steps, `preprocessed/new_lol_data_df`.
+- **Execution**: sequential (12 GB GPU cannot fit two trainers). Driven by `run_ab_grad_weight_ap.sh`. Wall clock ≈ 11 h per run, ≈ 22 h total.
+- **Outputs**: `outputs/ab_ap0_v2/`, `outputs/ab_ap100_v2/` (each has `test/` with rendered comparison samples at evaluation intervals).
+- **Decision criterion**: A/B listening on `outputs/ab_ap*_v2/test/` at the end of each run. Specifically rate:
+  1. Buzz/noise on voiced speech (especially deep voices: sion, demacia_male, noxus_male).
+  2. Fricative/sibilant clarity (/s/, /ʃ/, /f/, /h/) — the failure mode for `grad_weight_ap=0` if it exists.
+  3. Overall naturalness.
+- **Status**: 🔄 **In Progress** (`ab_ap0_v2` started, `ab_ap100_v2` queued).
 
 ### Key insight: held-out eval is mandatory for distillation
 - Train metrics can show steady improvement while the student is mildly overfitting. We only caught Run 4.1's specialization by running `phone_extractor_trainer/eval.py` with four conditions (clean/aug × in-domain/target-domain).

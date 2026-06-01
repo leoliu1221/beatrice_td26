@@ -37,7 +37,7 @@ fi
 echo "=== exporting phone_extractor ==="
 uv run python -m phone_extractor_trainer.export \
     outputs/phone_extractor_en/checkpoint_latest.pt \
-    assets/pretrained/phone_extractor_en.pt
+    assets/pretrained/phone_extractor/en_latest.pt
 
 # 3) Resume pitch trainer with augmentation ------------------------------------
 echo "=== resuming pitch_estimator with --augment to 500k steps ==="
@@ -54,7 +54,7 @@ uv run python -m pitch_estimator_trainer.train \
 echo "=== exporting pitch_estimator ==="
 uv run python -m pitch_estimator_trainer.export \
     outputs/pitch_estimator_v2/checkpoint_latest.pt \
-    assets/pretrained/pitch_estimator_v2.pt
+    assets/pretrained/pitch_estimator/vctk_latest.pt
 
 echo "=== $(date -Iseconds): noise-robust pipeline DONE ==="
 echo "Next step: retrain Beatrice on preprocessed/new_lol_data_df with the new feature extractors."

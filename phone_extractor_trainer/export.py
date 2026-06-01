@@ -15,8 +15,8 @@ Usage:
 
 Example:
     uv run python -m phone_extractor_trainer.export \
-        outputs/phone_extractor_en/checkpoint_latest.pt \
-        assets/pretrained/phone_extractor_en.pt
+        outputs/phone_extractor_en_v2/checkpoint_00300000.pt \
+        assets/pretrained/phone_extractor/<dataset>_<tag>_<steps>.pt
 """
 from __future__ import annotations
 

@@ -18,7 +18,7 @@
 # PhoneExtractor sub-trainer (HuBERT distillation, English-aligned):
 #   make phone-train PHONE_DATA=/path/to/english_audio
 #                            # train new phone extractor from scratch
-#   make phone-train PHONE_DATA=... PHONE_INIT=assets/pretrained/122_checkpoint_03000000.pt
+#   make phone-train PHONE_DATA=... PHONE_INIT=assets/pretrained/phone_extractor/jp_122_3000k.pt
 #                            # warm-start from shipped Japanese-leaning ckpt
 #   make phone-export        # export latest training ckpt -> Beatrice format
 #   make phone-tensorboard   # tail phone-extractor TensorBoard
@@ -26,7 +26,7 @@
 # PitchEstimator sub-trainer (pyworld-supervised, for better cross-gender conversion):
 #   make pitch-train PITCH_DATA=/path/to/diverse_pitch_audio
 #                            # train new pitch estimator from scratch
-#   make pitch-train PITCH_DATA=... PITCH_INIT=assets/pretrained/104_3_checkpoint_00300000.pt
+#   make pitch-train PITCH_DATA=... PITCH_INIT=assets/pretrained/pitch_estimator/jp_104_3_300k.pt
 #                            # warm-start from shipped ckpt
 #   make pitch-export        # export latest training ckpt -> Beatrice format
 #   make pitch-tensorboard   # tail pitch-estimator TensorBoard
@@ -50,11 +50,11 @@ LIBRISPEECH_DIR   := $(LIBRISPEECH_ROOT)/LibriSpeech/$(LIBRISPEECH_SPLIT)
 
 PHONE_DATA    ?= $(LIBRISPEECH_DIR)
 PHONE_OUT     ?= outputs/phone_extractor_en
-PHONE_INIT    ?= assets/pretrained/122_checkpoint_03000000.pt
+PHONE_INIT    ?= assets/pretrained/phone_extractor/jp_122_3000k.pt
 PHONE_STEPS   ?= 200000
 PHONE_BATCH   ?= 32
 PHONE_WORKERS ?= 4
-PHONE_EXPORT_OUT ?= assets/pretrained/phone_extractor_en.pt
+PHONE_EXPORT_OUT ?= assets/pretrained/phone_extractor/en_latest.pt
 PHONE_INIT_FLAG := $(if $(PHONE_INIT),--init-from $(PHONE_INIT),)
 PHONE_RESUME_FLAG := $(if $(RESUME),--resume,)
 # AUGMENT=1 enables noise-robust distillation: student sees augment_audio()-corrupted
@@ -66,11 +66,11 @@ VCTK_ROOT     := datasets/vctk
 VCTK_DIR      := $(VCTK_ROOT)/VCTK-Corpus-0.92/wav48_silence_trimmed
 PITCH_DATA    ?= $(VCTK_DIR)
 PITCH_OUT     ?= outputs/pitch_estimator_v2
-PITCH_INIT    ?= assets/pretrained/104_3_checkpoint_00300000.pt
+PITCH_INIT    ?= assets/pretrained/pitch_estimator/jp_104_3_300k.pt
 PITCH_STEPS   ?= 300000
 PITCH_BATCH   ?= 256
 PITCH_WORKERS ?= 8
-PITCH_EXPORT_OUT ?= assets/pretrained/pitch_estimator_v2.pt
+PITCH_EXPORT_OUT ?= assets/pretrained/pitch_estimator/vctk_latest.pt
 PITCH_INIT_FLAG := $(if $(PITCH_INIT),--init-from $(PITCH_INIT),)
 PITCH_RESUME_FLAG := $(if $(RESUME),--resume,)
 # AUGMENT=1 enables noise-robust training: student sees augmented audio,

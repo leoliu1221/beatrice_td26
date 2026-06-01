@@ -22,11 +22,12 @@ Usage:
         --out-dir  outputs/phone_extractor_en \
         --steps 200000
 
-To swap into Beatrice afterwards:
+To swap into Beatrice afterwards (see assets/pretrained/README.md for naming):
     uv run python -m phone_extractor_trainer.export \
-        outputs/phone_extractor_en/checkpoint_latest.pt \
-        assets/pretrained/phone_extractor_en.pt
-    # then point `phone_extractor_file` in assets/default_config.json at it.
+        outputs/phone_extractor_en_v2/checkpoint_00300000.pt \
+        assets/pretrained/phone_extractor/<dataset>_<tag>_<steps>.pt
+    # then retarget the current symlink:
+    #   ln -sfn <dataset>_<tag>_<steps>.pt assets/pretrained/phone_extractor/current.pt
 """
 from __future__ import annotations
 

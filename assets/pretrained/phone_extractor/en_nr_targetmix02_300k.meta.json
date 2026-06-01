@@ -1,0 +1,26 @@
+{
+  "module": "phone_extractor",
+  "tag": "en_nr_targetmix02_300k",
+  "kind": "trained",
+  "exported_from": "outputs/phone_extractor_en_v2/checkpoint_00300000.pt",
+  "exported_at": "2026-05-29",
+  "recipe": {
+    "init_from": "assets/pretrained/phone_extractor/jp_122_3000k.pt",
+    "dataset": "datasets/librispeech/LibriSpeech/train-clean-100",
+    "target_mix": {"dir": "preprocessed/new_lol_data_df", "ratio": 0.2},
+    "augment": true,
+    "steps": 300000,
+    "batch_size": 32,
+    "num_workers": 4
+  },
+  "eval": {
+    "script": "phone_extractor_trainer/eval_sweep.py",
+    "n_samples": 64,
+    "clean_librispeech": 0.7692,
+    "aug_librispeech":   0.7388,
+    "clean_target":      0.8390,
+    "aug_target":        0.7755
+  },
+  "supersedes": ["phone_extractor/en_clean_580k.pt"],
+  "notes": "Beats en_clean_580k by +0.130 on clean target, +0.121 on aug target. Use as current."
+}

@@ -15,8 +15,8 @@ Usage:
 
 Example:
     uv run python -m pitch_estimator_trainer.export \
-        outputs/pitch_estimator_v2/checkpoint_latest.pt \
-        assets/pretrained/pitch_estimator_v2.pt
+        outputs/pitch_estimator_v2/checkpoint_00300000.pt \
+        assets/pretrained/pitch_estimator/<dataset>_<tag>_<steps>.pt
 """
 from __future__ import annotations
 

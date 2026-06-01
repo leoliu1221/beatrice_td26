@@ -21,11 +21,12 @@ Usage:
         --out-dir  outputs/pitch_estimator_v2 \
         --steps 300000
 
-To swap into Beatrice afterwards:
+To swap into Beatrice afterwards (see assets/pretrained/README.md for naming):
     uv run python -m pitch_estimator_trainer.export \
-        outputs/pitch_estimator_v2/checkpoint_latest.pt \
-        assets/pretrained/pitch_estimator_v2.pt
-    # then point `pitch_estimator_file` in assets/default_config.json at it.
+        outputs/pitch_estimator_v2/checkpoint_00300000.pt \
+        assets/pretrained/pitch_estimator/<dataset>_<tag>_<steps>.pt
+    # then retarget the current symlink:
+    #   ln -sfn <dataset>_<tag>_<steps>.pt assets/pretrained/pitch_estimator/current.pt
 """
 from __future__ import annotations
 

@@ -1,0 +1,19 @@
+{
+  "module": "pitch_estimator",
+  "tag": "vctk_nr_300k",
+  "kind": "trained",
+  "exported_from": "outputs/pitch_estimator_v2/checkpoint_00300000.pt",
+  "exported_at": "2026-06-01",
+  "recipe": {
+    "init_from": "assets/pretrained/pitch_estimator/jp_104_3_300k.pt",
+    "dataset": "datasets/vctk/VCTK-Corpus-0.92/wav48_silence_trimmed",
+    "augment": true,
+    "augmentation_overrides": {"formant_shift_probability": 0.0},
+    "steps": 300000,
+    "batch_size": 256,
+    "num_workers": 8
+  },
+  "eval": {"notes": "No dedicated held-out script yet; train/acc and train/err_semitones plateaued cleanly."},
+  "supersedes": ["pitch_estimator/vctk_clean_300k.pt"],
+  "notes": "Noise-robust distillation: student sees augmented audio, pyworld F0 label computed from clean. formant_shift_probability forced to 0 so spectral-envelope warp does not perturb F0 labels."
+}

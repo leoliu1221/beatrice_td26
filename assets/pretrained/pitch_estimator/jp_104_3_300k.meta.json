@@ -1,0 +1,9 @@
+{
+  "module": "pitch_estimator",
+  "tag": "jp_104_3_300k",
+  "kind": "upstream",
+  "exported_from": "Beatrice upstream release",
+  "original_filename": "104_3_checkpoint_00300000.pt",
+  "recipe": {"notes": "Japanese-leaning ckpt from upstream Beatrice; used as warm-start for English/VCTK pitch training."},
+  "notes": "Do not delete. Used as --init-from for all PitchEstimator training."
+}

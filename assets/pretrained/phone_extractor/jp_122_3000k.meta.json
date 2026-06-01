@@ -1,0 +1,9 @@
+{
+  "module": "phone_extractor",
+  "tag": "jp_122_3000k",
+  "kind": "upstream",
+  "exported_from": "Beatrice upstream release",
+  "original_filename": "122_checkpoint_03000000.pt",
+  "recipe": {"notes": "Japanese-leaning ckpt from upstream Beatrice; used as warm-start for English training."},
+  "notes": "Do not delete. Used as --init-from for all PhoneExtractor training."
+}

@@ -1,0 +1,29 @@
+{
+  "comment": "Registry of all pretrained model variants. Each module has a 'current' symlink (current.pt) that configs should reference for stable resolution. Variants are immutable; never overwrite an existing variant file.",
+  "phone_extractor": {
+    "current_symlink": "phone_extractor/current.pt",
+    "current_target": "en_nr_targetmix02_300k.pt",
+    "variants": [
+      {"file": "phone_extractor/jp_122_3000k.pt",                 "kind": "upstream"},
+      {"file": "phone_extractor/en_clean_200k.pt",                "kind": "trained", "deprecated": true},
+      {"file": "phone_extractor/en_clean_580k.pt",                "kind": "trained", "deprecated": true},
+      {"file": "phone_extractor/en_nr_targetmix02_300k.pt",       "kind": "trained", "current": true}
+    ]
+  },
+  "pitch_estimator": {
+    "current_symlink": "pitch_estimator/current.pt",
+    "current_target": "vctk_nr_300k.pt",
+    "variants": [
+      {"file": "pitch_estimator/jp_104_3_300k.pt",  "kind": "upstream"},
+      {"file": "pitch_estimator/vctk_clean_300k.pt", "kind": "trained", "deprecated": true},
+      {"file": "pitch_estimator/vctk_nr_300k.pt",   "kind": "trained", "current": true}
+    ]
+  },
+  "vocoder": {
+    "current_symlink": "vocoder/current.pt.gz",
+    "current_target": "libritts_r_200_2750k.pt.gz",
+    "variants": [
+      {"file": "vocoder/libritts_r_200_2750k.pt.gz", "kind": "upstream", "current": true}
+    ]
+  }
+}
