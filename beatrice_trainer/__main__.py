@@ -5,12 +5,15 @@
 import argparse
 import gc
 import gzip
+import inspect
 import json
 import math
 import os
+import random
 import shutil
 import warnings
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from copy import deepcopy
 from fractions import Fraction
@@ -22,6 +25,7 @@ from typing import BinaryIO, Literal, Optional, Union, Sequence, Iterable, Calla
 
 import numpy as np
 import pyworld
+import soundfile  # noqa: F401
 import torch
 import torch.nn as nn
 import torchaudio
@@ -30,7 +34,13 @@ from torch.nn.utils import remove_weight_norm, weight_norm
 from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
-assert "soundfile" in torchaudio.list_audio_backends()
+warnings.filterwarnings(
+    "ignore",
+    message=r".*torchaudio\.load_with_torchcodec.*",
+    category=UserWarning,
+    module=r"torchaudio\._backend\..*",
+)
+
 if not hasattr(torch.amp, "GradScaler"):
 
     class GradScaler(torch.cuda.amp.GradScaler):
@@ -52,6 +62,10 @@ def repo_root() -> Path:
     d = Path.cwd() / "dummy" if is_notebook() else Path(__file__)
     assert d.is_absolute(), d
     for d in d.parents:
+        # Prefer the nearest Beatrice project root when this package is vendored
+        # inside a larger repository whose outer .git would otherwise win.
+        if (d / "pyproject.toml").is_file() and (d / "assets").is_dir():
+            return d
         if (d / ".git").is_dir():
             return d
     raise RuntimeError("Repository root is not found.")
@@ -69,16 +83,16 @@ dict_default_hparams = {
     "batch_size": 8,
     "grad_weight_loudness": 1.0,  # grad_weight は比が同じなら同じ意味になるはず
     "grad_weight_mel": 50.0,
-    "grad_weight_ap": 100.0,
+    "grad_weight_ap": 0.0,
     "grad_weight_adv": 150.0,
     "grad_weight_fm": 150.0,
     "grad_balancer_ema_decay": 0.995,
     "use_amp": True,
-    "num_workers": 16,
-    "n_steps": 10000,
-    "warmup_steps": 5000,
-    "evaluation_interval": 2000,
-    "save_interval": 2000,
+    "num_workers": 24,
+    "n_steps": 60000,
+    "warmup_steps": 10000,
+    "evaluation_interval": 5000,
+    "save_interval": 5000,
     "in_sample_rate": 16000,  # 変更不可
     "out_sample_rate": 24000,  # 変更不可
     "wav_length": 4 * 24000,  # 4s
@@ -86,7 +100,8 @@ dict_default_hparams = {
     "phone_noise_ratio": 0.5,
     "vq_topk": 4,
     "training_time_vq": "none",  # "none", "self" or "random"
-    "floor_noise_level": 1e-3,
+    "augment_pitch": False,
+    "floor_noise_level": 1e-4,
     "record_metrics": False,
     # augmentation
     "augmentation_snr_candidates": [20.0, 25.0, 30.0, 35.0, 40.0, 45.0],
@@ -97,8 +112,8 @@ dict_default_hparams = {
     "augmentation_lpf_probability": 0.2,
     "augmentation_lpf_cutoff_freq_candidates": [2000.0, 3000.0, 4000.0, 6000.0],
     # data
-    "phone_extractor_file": "assets/pretrained/122_checkpoint_03000000.pt",
-    "pitch_estimator_file": "assets/pretrained/104_3_checkpoint_00300000.pt",
+    "phone_extractor_file": "assets/pretrained/phone_extractor_en.pt",
+    "pitch_estimator_file": "assets/pretrained/pitch_estimator_v2.pt",
     "in_ir_wav_dir": "assets/ir",
     "in_noise_wav_dir": "assets/noise",
     "in_test_wav_dir": "assets/test",
@@ -111,6 +126,7 @@ dict_default_hparams = {
     "compile_d4c": False,
     "compile_discriminator": False,
     "profile": False,
+    "validate_finite": False,
 }
 
 if __name__ == "__main__":
@@ -213,6 +229,78 @@ class AttrDict(dict):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.__dict__ = self
+
+
+class CudaBatchPrefetcher:
+    def __init__(self, loader: torch.utils.data.DataLoader, device: torch.device):
+        if device.type != "cuda":
+            raise ValueError("CudaBatchPrefetcher requires a CUDA device.")
+        self.loader = loader
+        self.device = device
+        self.stream = torch.cuda.Stream(device=device)
+        self._iter = None
+        self._next_batch = None
+
+    def __iter__(self):
+        self._iter = iter(self.loader)
+        self._preload()
+        return self
+
+    def __next__(self):
+        if self._next_batch is None:
+            raise StopIteration
+        current_stream = torch.cuda.current_stream(self.device)
+        current_stream.wait_stream(self.stream)
+        batch = self._next_batch
+        for tensor in batch:
+            tensor.record_stream(current_stream)
+        self._preload()
+        return batch
+
+    def _preload(self):
+        assert self._iter is not None
+        try:
+            batch = next(self._iter)
+        except StopIteration:
+            self._next_batch = None
+            return
+        with torch.cuda.stream(self.stream):
+            self._next_batch = tuple(
+                tensor.to(self.device, non_blocking=True) for tensor in batch
+            )
+
+
+def emit_progress(
+    *,
+    phase: str,
+    message: Optional[str] = None,
+    percent: Optional[int] = None,
+    iteration: Optional[int] = None,
+    total: Optional[int] = None,
+    output_dir: Optional[Path] = None,
+    manifest: Optional[Path] = None,
+):
+    payload: dict[str, object] = {"phase": phase}
+    if message:
+        payload["message"] = message
+    if percent is not None:
+        payload["percent"] = max(0, min(100, int(percent)))
+    if iteration is not None:
+        payload["iteration"] = int(iteration)
+    if total is not None:
+        payload["total"] = int(total)
+    if output_dir is not None:
+        payload["output_dir"] = str(output_dir)
+    if manifest is not None:
+        payload["manifest"] = str(manifest)
+    print(f"UBERDSP_PROGRESS {json.dumps(payload, ensure_ascii=False)}", flush=True)
+
+
+def phase_percent(start: int, end: int, index: int, total: int) -> int:
+    if total <= 0:
+        return end
+    ratio = max(0.0, min(1.0, index / total))
+    return int(round(start + (end - start) * ratio))
 
 
 # %% [markdown]
@@ -2163,6 +2251,7 @@ class ConverterNetwork(nn.Module):
         vq_topk: int = 4,
         training_time_vq: Literal["none", "self", "random"] = "none",
         phone_noise_ratio: int = 0.5,
+        augment_pitch: bool = True,
         floor_noise_level: float = 1e-3,
     ):
         super().__init__()
@@ -2172,6 +2261,7 @@ class ConverterNetwork(nn.Module):
         }
         self.pitch_bins = pitch_bins
         self.phone_noise_ratio = phone_noise_ratio
+        self.augment_pitch = augment_pitch
         self.floor_noise_level = floor_noise_level
         self.out_sample_rate = out_sample_rate = 24000
         phone_channels = 128
@@ -2321,7 +2411,7 @@ class ConverterNetwork(nn.Module):
             # [batch_size, 1, wav_length] -> [batch_size, pitch_bins, length], [batch_size, 1, length]
             pitch, energy = pitch_estimator(x)
             # augmentation
-            if self.training:
+            if self.training and self.augment_pitch:
                 # [batch_size, pitch_bins - 1]
                 weights = pitch.softmax(1)[:, 1:, :].mean(2)
                 # [batch_size]
@@ -2513,6 +2603,7 @@ class ConverterNetwork(nn.Module):
         slice_segment_length: int,
         y_all: torch.Tensor,
         enable_loss_ap: bool = False,
+        return_stats: bool = True,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -2567,7 +2658,8 @@ class ConverterNetwork(nn.Module):
             ):
                 loss_loudness_i = F.mse_loss(y_hat_loudness_i, y_loudness_i)
                 loss_loudness += loss_loudness_i * math.sqrt(win_length)
-                stats[f"loss_loudness_{win_length}"] = loss_loudness_i.item()
+                if return_stats:
+                    stats[f"loss_loudness_{win_length}"] = loss_loudness_i.item()
 
             for melspectrogram in self.melspectrograms:
                 melsp_periodic_signal = melspectrogram(periodic_signal)
@@ -2598,9 +2690,10 @@ class ConverterNetwork(nn.Module):
                 y_mel = self._normalize_melsp(melspectrogram(y_all_truncated))
                 loss_mel_i = F.l1_loss(y_hat_mel, y_mel)
                 loss_mel += loss_mel_i
-                stats[
-                    f"loss_mel_{melspectrogram.win_length}_{melspectrogram.n_mels}"
-                ] = loss_mel_i.item()
+                if return_stats:
+                    stats[
+                        f"loss_mel_{melspectrogram.win_length}_{melspectrogram.n_mels}"
+                    ] = loss_mel_i.item()
 
             loss_mel /= len(self.melspectrograms)
 
@@ -2955,7 +3048,7 @@ class MultiPeriodDiscriminator(nn.Module):
         return y_d_rs, y_d_gs, fmap_rs, fmap_gs
 
     def forward_and_compute_loss(
-        self, y: torch.Tensor, y_hat: torch.Tensor
+        self, y: torch.Tensor, y_hat: torch.Tensor, return_stats: bool = True
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]]:
         y_d_rs, y_d_gs, fmap_rs, fmap_gs = self(y, y_hat, flg_san_train=self.san)
         stats = {}
@@ -2978,8 +3071,9 @@ class MultiPeriodDiscriminator(nn.Module):
                     dg = dg.float()
                     r_loss = (1.0 - dr).square().mean()
                     g_loss = dg.square().mean()
-                stats[f"{name}_dr_loss"] = r_loss.item()
-                stats[f"{name}_dg_loss"] = g_loss.item()
+                if return_stats:
+                    stats[f"{name}_dr_loss"] = r_loss.item()
+                    stats[f"{name}_dg_loss"] = g_loss.item()
                 d_loss += r_loss + g_loss
             # adversarial loss
             adv_loss = 0.0
@@ -2990,7 +3084,8 @@ class MultiPeriodDiscriminator(nn.Module):
                 else:
                     dg = dg.float()
                     g_loss = (1.0 - dg).square().mean()
-                stats[f"{name}_gg_loss"] = g_loss.item()
+                if return_stats:
+                    stats[f"{name}_gg_loss"] = g_loss.item()
                 adv_loss += g_loss
             # feature mathcing loss
             fm_loss = 0.0
@@ -2998,9 +3093,11 @@ class MultiPeriodDiscriminator(nn.Module):
                 fm_loss_i = 0.0
                 for j, (r, g) in enumerate(zip(fr, fg)):
                     fm_loss_ij = (r.detach().float() - g.float()).abs().mean()
-                    stats[f"~{name}_fm_loss_{j}"] = fm_loss_ij.item()
+                    if return_stats:
+                        stats[f"~{name}_fm_loss_{j}"] = fm_loss_ij.item()
                     fm_loss_i += fm_loss_ij
-                stats[f"{name}_fm_loss"] = fm_loss_i.item()
+                if return_stats:
+                    stats[f"{name}_fm_loss"] = fm_loss_i.item()
                 fm_loss += fm_loss_i
         return d_loss, adv_loss, fm_loss, stats
 
@@ -3036,11 +3133,16 @@ class GradBalancer:
         input: torch.Tensor,
         scaler: Optional[torch.amp.GradScaler] = None,
         skip_update_ema: bool = False,
+        return_stats: bool = True,
     ) -> dict[str, float]:
         stats = {}
+        active_loss_names = set(losses.keys())
         if skip_update_ema:
-            assert len(losses) == len(self.ema_total)
-            ema_norms = {k: tot / self.ema_fix[k] for k, tot in self.ema_total.items()}
+            ema_norms = {
+                k: self.ema_total[k] / self.ema_fix[k]
+                for k in active_loss_names
+                if self.ema_fix[k] != 0.0
+            }
         else:
             # 各 loss に対して d loss / d input とそのノルムを計算する
             norms = {}
@@ -3065,13 +3167,18 @@ class GradBalancer:
             for key, value in norms.items():
                 self.ema_total[key] = self.ema_total[key] * self.ema_decay + value
                 self.ema_fix[key] = self.ema_fix[key] * self.ema_decay + 1.0
-            ema_norms = {k: tot / self.ema_fix[k] for k, tot in self.ema_total.items()}
+            ema_norms = {
+                k: self.ema_total[k] / self.ema_fix[k]
+                for k in active_loss_names
+                if self.ema_fix[k] != 0.0
+            }
 
             # ログを取る
             total_ema_norm = sum(ema_norms.values())
-            for k, ema_norm in ema_norms.items():
-                stats[f"grad_norm_value_{k}"] = ema_norm
-                stats[f"grad_norm_ratio_{k}"] = ema_norm / (total_ema_norm + 1e-12)
+            if return_stats:
+                for k, ema_norm in ema_norms.items():
+                    stats[f"grad_norm_value_{k}"] = ema_norm
+                    stats[f"grad_norm_ratio_{k}"] = ema_norm / (total_ema_norm + 1e-12)
 
         # loss の係数の比率を計算する
         if self.rescale_grads:
@@ -3183,6 +3290,30 @@ def compute_mean_f0(
     return math.exp(mean_log_f0)
 
 
+def compute_speaker_f0_job(args: tuple[int, list[Path]]) -> tuple[int, float]:
+    speaker_id, files = args
+    return speaker_id, compute_mean_f0(files)
+
+
+def compute_test_pitch_shift_job(
+    args: tuple[int, Path, list[int], list[float]]
+) -> tuple[int, float, list[int]]:
+    index, file, target_ids, speaker_f0s = args
+    source_f0 = compute_mean_f0([file], method="harvest")
+    if math.isnan(source_f0):
+        return index, source_f0, [0] * len(target_ids)
+
+    pitch_shifts = []
+    for target_id in target_ids:
+        target_f0 = speaker_f0s[target_id]
+        if target_f0 != target_f0:
+            pitch_shift = 0
+        else:
+            pitch_shift = int(round(12.0 * math.log2(target_f0 / source_f0)))
+        pitch_shifts.append(pitch_shift)
+    return index, source_f0, pitch_shifts
+
+
 # %% [markdown]
 # ## Dataset
 
@@ -3198,6 +3329,23 @@ def get_resampler(
             sr_before, sr_after
         ).to(device)
     return cache[(sr_before, sr_after, device)]
+
+
+def load_audio_asset_cached(
+    file: Union[str, bytes, os.PathLike], cache={}, clone: bool = True
+) -> tuple[torch.Tensor, int]:
+    key = os.fspath(file)
+    if key not in cache:
+        cache[key] = torchaudio.load(file, backend="soundfile")
+    wav, sr = cache[key]
+    return (wav.clone() if clone else wav), sr
+
+
+def init_training_worker(worker_id: int):
+    seed = torch.initial_seed() % (2**32)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.set_num_threads(1)
 
 
 def convolve(signal: torch.Tensor, ir: torch.Tensor) -> torch.Tensor:
@@ -3301,7 +3449,7 @@ def get_noise(
     while current_length < n_samples:
         idx_files = torch.randint(0, len(files), ())
         file = files[idx_files]
-        wav, sr = torchaudio.load(file, backend="soundfile")
+        wav, sr = load_audio_asset_cached(file, clone=False)
         assert wav.size(0) == 1
         augmented_sample_rate = int(
             round(
@@ -3377,7 +3525,7 @@ def augment_audio(
     # clean, noise にリバーブをかける
     if torch.rand(()) < reverb_probability:
         ir_file = ir_files[torch.randint(0, len(ir_files), ())]
-        ir, sr = torchaudio.load(ir_file, backend="soundfile")
+        ir, sr = load_audio_asset_cached(ir_file, clone=False)
         assert ir.size() == (2, sr), ir.size()
         assert sr == sample_rate, (sr, sample_rate)
         signals = convolve(signals, ir)
@@ -3456,6 +3604,11 @@ class WavDataset(torch.utils.data.Dataset):
         self.augmentation_lpf_cutoff_freq_candidates = (
             augmentation_lpf_cutoff_freq_candidates
         )
+        self.formant_shift_candidates = [-2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0]
+        self._clip_cache_max_entries = 16
+        self._clip_cache: OrderedDict[
+            tuple[str, float], tuple[torch.Tensor, torch.Tensor]
+        ] = OrderedDict()
 
         if (noise_files is None) is not (ir_files is None):
             raise ValueError("noise_files and ir_files must be both None or not None")
@@ -3463,17 +3616,24 @@ class WavDataset(torch.utils.data.Dataset):
         self.in_hop_length = in_sample_rate // 100
         self.out_hop_length = out_sample_rate // 100  # 10ms 刻み
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, int, int]:
-        file, speaker_id = self.audio_files[index]
-        clean_wav, sample_rate = torchaudio.load(file, backend="soundfile")
-        if clean_wav.size(0) != 1:
-            ch = torch.randint(0, clean_wav.size(0), ())
-            clean_wav = clean_wav[ch : ch + 1]
+    def _get_preprocessed_clean_pair(
+        self,
+        file: Union[str, bytes, os.PathLike],
+        formant_shift: float,
+        clean_wav: Optional[torch.Tensor] = None,
+        sample_rate: Optional[int] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (os.fspath(file), float(formant_shift))
+        cached = self._clip_cache.get(key)
+        if cached is not None:
+            self._clip_cache.move_to_end(key)
+            clean_wav, clean_wav_16k = cached
+            return clean_wav.clone(), clean_wav_16k.clone()
 
-        formant_shift_candidates = [-2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0]
-        formant_shift = formant_shift_candidates[
-            torch.randint(0, len(formant_shift_candidates), ()).item()
-        ]
+        if clean_wav is None or sample_rate is None:
+            clean_wav, sample_rate = load_audio_asset_cached(file, clone=False)
+        if clean_wav.size(0) != 1:
+            raise ValueError("Only mono clips can use the preprocessing cache.")
 
         resampler_fraction = Fraction(
             sample_rate / self.out_sample_rate * 2.0 ** (formant_shift / 12.0)
@@ -3481,21 +3641,50 @@ class WavDataset(torch.utils.data.Dataset):
         clean_wav = get_resampler(
             resampler_fraction.numerator, resampler_fraction.denominator
         )(clean_wav)
+        clean_wav = F.pad(clean_wav, (self.wav_length, self.wav_length))
+        clean_wav_16k = get_resampler(self.out_sample_rate, self.in_sample_rate)(clean_wav)
+
+        self._clip_cache[key] = (clean_wav, clean_wav_16k)
+        self._clip_cache.move_to_end(key)
+        while len(self._clip_cache) > self._clip_cache_max_entries:
+            self._clip_cache.popitem(last=False)
+        return clean_wav.clone(), clean_wav_16k.clone()
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+        file, speaker_id = self.audio_files[index]
+        clean_wav, sample_rate = load_audio_asset_cached(file, clone=False)
+        is_mono = clean_wav.size(0) == 1
+        if not is_mono:
+            ch = torch.randint(0, clean_wav.size(0), ())
+            clean_wav = clean_wav[ch : ch + 1]
+
+        formant_shift = self.formant_shift_candidates[
+            torch.randint(0, len(self.formant_shift_candidates), ()).item()
+        ]
+        if is_mono:
+            clean_wav, clean_wav_16k = self._get_preprocessed_clean_pair(
+                file,
+                formant_shift,
+                clean_wav=clean_wav,
+                sample_rate=sample_rate,
+            )
+        else:
+            resampler_fraction = Fraction(
+                sample_rate / self.out_sample_rate * 2.0 ** (formant_shift / 12.0)
+            ).limit_denominator(300)
+            clean_wav = get_resampler(
+                resampler_fraction.numerator, resampler_fraction.denominator
+            )(clean_wav)
+            clean_wav = F.pad(clean_wav, (self.wav_length, self.wav_length))
+            clean_wav_16k = get_resampler(self.out_sample_rate, self.in_sample_rate)(clean_wav)
 
         assert clean_wav.size(0) == 1
         assert clean_wav.size(1) != 0
 
-        clean_wav = F.pad(clean_wav, (self.wav_length, self.wav_length))
-
         if self.noise_files is None:
             assert False
-            noisy_wav_16k = get_resampler(self.out_sample_rate, self.in_sample_rate)(
-                clean_wav
-            )
+            noisy_wav_16k = clean_wav_16k
         else:
-            clean_wav_16k = get_resampler(self.out_sample_rate, self.in_sample_rate)(
-                clean_wav
-            )
             noisy_wav_16k = augment_audio(
                 clean_wav_16k,
                 self.in_sample_rate,
@@ -3631,21 +3820,43 @@ def get_decompressed_optimizer_state_dict(compressed_state_dict: dict) -> dict:
     return state_dict
 
 
+def create_training_adamw(
+    params: Iterable[torch.nn.Parameter],
+    learning_rate: float,
+    betas: Sequence[float],
+    eps: float,
+    device: torch.device,
+) -> torch.optim.AdamW:
+    kwargs = {
+        "betas": betas,
+        "eps": eps,
+    }
+    adamw_signature = inspect.signature(torch.optim.AdamW)
+    if device.type == "cuda":
+        if "fused" in adamw_signature.parameters:
+            kwargs["fused"] = True
+        elif "foreach" in adamw_signature.parameters:
+            kwargs["foreach"] = True
+    return torch.optim.AdamW(params, learning_rate, **kwargs)
+
+
 # Windows/uv compatibility: when invoked as `python -m beatrice_trainer` (or via
-# `uv run`), this file is executed as `__main__`, so `WavDataset.__module__` is
-# `"__main__"`. On Windows, DataLoader workers use `spawn`, and pickle looks up
-# the class on `__main__` in the child process -- which is the multiprocessing
-# bootstrap, not this file. Point the class at its real, importable location so
-# unpickling succeeds. The `if __name__ == "__main__":` guards prevent the
-# training entrypoint from re-running when the module is imported this way.
-if WavDataset.__module__ == "__main__":
+# `uv run`), this file is executed as `__main__`. On Windows, DataLoader workers
+# use `spawn`, and pickle looks up classes/functions on `__main__` in the child
+# process -- which is the multiprocessing bootstrap, not this file. Point the
+# symbols at their real, importable location so unpickling succeeds. The
+# `if __name__ == "__main__":` guards prevent the training entrypoint from
+# re-running when the module is imported this way.
+if WavDataset.__module__ == "__main__" or init_training_worker.__module__ == "__main__":
     import sys as _sys
 
     WavDataset.__module__ = "beatrice_trainer.__main__"
+    init_training_worker.__module__ = "beatrice_trainer.__main__"
     # Ensure pickle's identity check (`beatrice_trainer.__main__.WavDataset is
-    # WavDataset`) passes by aliasing this `__main__` module under its real
-    # dotted name. Workers re-import via the dotted name; the
-    # `if __name__ == "__main__":` guards prevent training re-entry there.
+    # WavDataset`) and equivalent function lookups pass by aliasing this
+    # `__main__` module under its real dotted name. Workers re-import via the
+    # dotted name; the `if __name__ == "__main__":` guards prevent training
+    # re-entry there.
     _sys.modules.setdefault("beatrice_trainer.__main__", _sys.modules["__main__"])
 
 
@@ -3653,11 +3864,16 @@ def prepare_training():
     # 各種準備をする
     # 副作用として、出力ディレクトリと TensorBoard のログファイルなどが生成される
 
+    emit_progress(phase="preflight", message="Checking trainer configuration...", percent=1)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device={device}")
 
     torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.allow_tf32 = True
     torch.backends.cuda.matmul.allow_tf32 = True
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
 
     (h, in_wav_dataset_dir, out_dir, resume, skip_training) = (
         prepare_training_configs_for_experiment
@@ -3669,6 +3885,7 @@ def prepare_training():
     pprint(h)
     print()
     h = AttrDict(h)
+    emit_progress(phase="preflight", message="Validating trainer inputs...", percent=3)
 
     if not in_wav_dataset_dir.is_dir():
         raise ValueError(f"{in_wav_dataset_dir} is not found.")
@@ -3703,6 +3920,12 @@ def prepare_training():
     assert in_test_wav_dir.is_dir(), in_test_wav_dir
 
     # .wav または *.flac のファイルを再帰的に取得
+    emit_progress(
+        phase="loading_dataset",
+        message="Scanning dataset folders and augmentation assets...",
+        percent=5,
+        output_dir=out_dir,
+    )
     noise_files = sorted(
         list(in_noise_wav_dir.rglob("*.wav")) + list(in_noise_wav_dir.rglob("*.flac"))
     )
@@ -3721,7 +3944,9 @@ def prepare_training():
         speakers: list[str] = []
         training_filelist: list[tuple[Path, int]] = []
         speaker_audio_files: list[list[Path]] = []
-        for speaker_dir in sorted(in_wav_dataset_dir.iterdir()):
+        speaker_dirs = sorted(in_wav_dataset_dir.iterdir())
+        total_dirs = len(speaker_dirs)
+        for speaker_index, speaker_dir in enumerate(speaker_dirs, start=1):
             if not speaker_dir.is_dir():
                 continue
             candidates = []
@@ -3737,6 +3962,12 @@ def prepare_training():
                 speakers.append(speaker_dir.name)
                 training_filelist.extend([(file, speaker_id) for file in candidates])
                 speaker_audio_files.append(candidates)
+            emit_progress(
+                phase="loading_dataset",
+                message=f"Scanning speaker folders... {speaker_index}/{max(total_dirs, 1)}",
+                percent=phase_percent(6, 14, speaker_index, max(total_dirs, 1)),
+                output_dir=out_dir,
+            )
         return speakers, training_filelist, speaker_audio_files
 
     speakers, training_filelist, speaker_audio_files = get_training_filelist(
@@ -3785,6 +4016,12 @@ def prepare_training():
     if len(test_filelist) > 12:
         print("  ...")
     print()
+    emit_progress(
+        phase="loading_dataset",
+        message=f"Indexed {len(training_filelist)} clips across {n_speakers} speakers.",
+        percent=15,
+        output_dir=out_dir,
+    )
 
     # データ
 
@@ -3804,51 +4041,157 @@ def prepare_training():
         augmentation_lpf_probability=h.augmentation_lpf_probability,
         augmentation_lpf_cutoff_freq_candidates=h.augmentation_lpf_cutoff_freq_candidates,
     )
-    training_loader = torch.utils.data.DataLoader(
-        training_dataset,
-        num_workers=min(h.num_workers, os.cpu_count()),
-        collate_fn=training_dataset.collate,
-        shuffle=True,
-        sampler=None,
-        batch_size=h.batch_size,
-        pin_memory=True,
-        drop_last=True,
-        persistent_workers=True,
+    effective_batch_size = min(h.batch_size, len(training_filelist))
+    if effective_batch_size < h.batch_size:
+        warnings.warn(
+            f"Reducing batch_size from {h.batch_size} to {effective_batch_size} "
+            f"because only {len(training_filelist)} training clips are available."
+        )
+
+    num_workers = min(h.num_workers, os.cpu_count() or 1)
+
+    dataloader_kwargs = {}
+    if num_workers > 0:
+        dataloader_kwargs["prefetch_factor"] = 8 if num_workers <= 4 else 4
+        dataloader_kwargs["persistent_workers"] = True
+        dataloader_kwargs["worker_init_fn"] = init_training_worker
+        dataloader_kwargs["in_order"] = False
+    if device.type == "cuda":
+        dataloader_kwargs["pin_memory_device"] = "cuda"
+    print(
+        "Training loader configuration: "
+        f"batch_size={effective_batch_size}, num_workers={num_workers}, "
+        f"prefetch_factor={dataloader_kwargs.get('prefetch_factor', 0)}, "
+        f"in_order={dataloader_kwargs.get('in_order', True)}, "
+        f"pin_memory_device={dataloader_kwargs.get('pin_memory_device', 'cpu')}"
     )
 
+    batches_per_epoch = len(training_filelist) // effective_batch_size
+    sampler = None
+    shuffle = True
+    if batches_per_epoch <= 2:
+        # Tiny speaker datasets can end up with only one or two full batches per
+        # epoch, which causes constant iterator resets and visibly spiky GPU
+        # utilization. Sample with replacement so workers keep the GPU fed.
+        target_batches_per_epoch = 64
+        sampler = torch.utils.data.RandomSampler(
+            training_dataset,
+            replacement=True,
+            num_samples=effective_batch_size * target_batches_per_epoch,
+        )
+        shuffle = False
+        print(
+            "Using replacement sampling for smoother GPU utilization on a tiny "
+            f"dataset ({len(training_filelist)} clips, {batches_per_epoch} full "
+            f"batch{'es' if batches_per_epoch != 1 else ''} per epoch)."
+        )
+
+    training_loader = torch.utils.data.DataLoader(
+        training_dataset,
+        num_workers=num_workers,
+        collate_fn=training_dataset.collate,
+        shuffle=shuffle,
+        sampler=sampler,
+        batch_size=effective_batch_size,
+        pin_memory=True,
+        drop_last=True,
+        **dataloader_kwargs,
+    )
+
+    emit_progress(
+        phase="computing_mean_f0",
+        message="Computing average pitch for each speaker...",
+        percent=18,
+        output_dir=out_dir,
+    )
     print("Computing mean F0s of target speakers...", end="")
-    speaker_f0s = []
-    for speaker, files in enumerate(speaker_audio_files):
+    total_speakers = len(speaker_audio_files)
+    speaker_f0s = [math.nan] * total_speakers
+    speaker_f0_inputs = []
+    for speaker_index, files in enumerate(speaker_audio_files):
         if len(files) > 10:
             files = Random(42).sample(files, 10)
-        f0 = compute_mean_f0(files)
-        speaker_f0s.append(f0)
-        if speaker % 5 == 0:
-            print()
-        print(f"  {speaker:3d}: {f0:.1f}Hz", end=",")
+        speaker_f0_inputs.append((speaker_index, files))
+    speaker_f0_parallelism = min(os.cpu_count() or 1, max(1, total_speakers), 8)
+    if speaker_f0_parallelism > 1:
+        with ThreadPoolExecutor(max_workers=speaker_f0_parallelism) as executor:
+            for speaker, f0 in executor.map(compute_speaker_f0_job, speaker_f0_inputs):
+                speaker_f0s[speaker] = f0
+                if speaker % 5 == 0:
+                    print()
+                print(f"  {speaker:3d}: {f0:.1f}Hz", end=",")
+                emit_progress(
+                    phase="computing_mean_f0",
+                    message=f"Computing average pitch for speaker {speaker + 1}/{max(total_speakers, 1)}...",
+                    percent=phase_percent(18, 30, speaker + 1, max(total_speakers, 1)),
+                    output_dir=out_dir,
+                )
+    else:
+        for speaker, f0 in map(compute_speaker_f0_job, speaker_f0_inputs):
+            speaker_f0s[speaker] = f0
+            if speaker % 5 == 0:
+                print()
+            print(f"  {speaker:3d}: {f0:.1f}Hz", end=",")
+            emit_progress(
+                phase="computing_mean_f0",
+                message=f"Computing average pitch for speaker {speaker + 1}/{max(total_speakers, 1)}...",
+                percent=phase_percent(18, 30, speaker + 1, max(total_speakers, 1)),
+                output_dir=out_dir,
+            )
     print()
     print("Done.")
+    emit_progress(
+        phase="computing_pitch_shifts",
+        message="Preparing test pitch shifts...",
+        percent=31,
+        output_dir=out_dir,
+    )
     print("Computing pitch shifts for test files...")
-    test_pitch_shifts = []
-    source_f0s = []
-    for i, (file, target_ids) in enumerate(
-        tqdm(test_filelist, desc="Computing pitch shifts")
-    ):
-        source_f0 = compute_mean_f0([file], method="harvest")
-        source_f0s.append(source_f0)
-        if math.isnan(source_f0):
-            test_pitch_shifts.append([0] * len(target_ids))
-            continue
-        pitch_shifts = []
-        for target_id in target_ids:
-            target_f0 = speaker_f0s[target_id]
-            if target_f0 != target_f0:
-                pitch_shift = 0
-            else:
-                pitch_shift = int(round(12.0 * math.log2(target_f0 / source_f0)))
-            pitch_shifts.append(pitch_shift)
-        test_pitch_shifts.append(pitch_shifts)
+    test_pitch_shifts = [None] * len(test_filelist)
+    source_f0s = [math.nan] * len(test_filelist)
+    total_test_files = len(test_filelist)
+    pitch_shift_inputs = [
+        (i, file, target_ids, speaker_f0s)
+        for i, (file, target_ids) in enumerate(test_filelist)
+    ]
+    pitch_shift_parallelism = min(os.cpu_count() or 1, max(1, total_test_files), 8)
+    if pitch_shift_parallelism > 1:
+        with ThreadPoolExecutor(max_workers=pitch_shift_parallelism) as executor:
+            for i, source_f0, pitch_shifts in tqdm(
+                executor.map(compute_test_pitch_shift_job, pitch_shift_inputs),
+                total=total_test_files,
+                desc="Computing pitch shifts",
+            ):
+                source_f0s[i] = source_f0
+                test_pitch_shifts[i] = pitch_shifts
+                emit_progress(
+                    phase="computing_pitch_shifts",
+                    message=f"Preparing test pitch shifts... {i + 1}/{max(total_test_files, 1)}",
+                    percent=phase_percent(31, 38, i + 1, max(total_test_files, 1)),
+                    output_dir=out_dir,
+                )
+    else:
+        for i, source_f0, pitch_shifts in tqdm(
+            map(compute_test_pitch_shift_job, pitch_shift_inputs),
+            total=total_test_files,
+            desc="Computing pitch shifts",
+        ):
+            source_f0s[i] = source_f0
+            test_pitch_shifts[i] = pitch_shifts
+            emit_progress(
+                phase="computing_pitch_shifts",
+                message=f"Preparing test pitch shifts... {i + 1}/{max(total_test_files, 1)}",
+                percent=phase_percent(31, 38, i + 1, max(total_test_files, 1)),
+                output_dir=out_dir,
+            )
+    test_pitch_shifts = list(test_pitch_shifts)
     print("Done.")
+    emit_progress(
+        phase="loading_models",
+        message="Loading pretrained checkpoints and optimizer state...",
+        percent=40,
+        output_dir=out_dir,
+    )
 
     # モデルと最適化
 
@@ -3881,21 +4224,30 @@ def prepare_training():
         h.vq_topk,
         h.training_time_vq,
         h.phone_noise_ratio,
+        h.augment_pitch,
         h.floor_noise_level,
     ).to(device)
     net_d = MultiPeriodDiscriminator(san=h.san).to(device)
 
-    optim_g = torch.optim.AdamW(
+    optim_g = create_training_adamw(
         net_g.parameters(),
         h.learning_rate_g,
-        betas=h.adam_betas,
-        eps=h.adam_eps,
+        h.adam_betas,
+        h.adam_eps,
+        device,
     )
-    optim_d = torch.optim.AdamW(
+    optim_d = create_training_adamw(
         net_d.parameters(),
         h.learning_rate_d,
-        betas=h.adam_betas,
-        eps=h.adam_eps,
+        h.adam_betas,
+        h.adam_eps,
+        device,
+    )
+    print(
+        "Optimizer configuration: "
+        f"generator={type(optim_g).__name__}, discriminator={type(optim_d).__name__}, "
+        f"fused={getattr(optim_g, 'defaults', {}).get('fused', False)}, "
+        f"foreach={getattr(optim_g, 'defaults', {}).get('foreach', False)}"
     )
 
     grad_scaler = torch.amp.GradScaler("cuda", enabled=h.use_amp)
@@ -3952,6 +4304,12 @@ def prepare_training():
             initial_iteration = checkpoint["iteration"]
         grad_balancer.load_state_dict(checkpoint["grad_balancer"])
         grad_scaler.load_state_dict(checkpoint["grad_scaler"])
+    emit_progress(
+        phase="initializing_vq",
+        message="Initializing training state...",
+        percent=43,
+        output_dir=out_dir,
+    )
 
     def wav_iterator(files):
         for file in files:
@@ -3965,6 +4323,14 @@ def prepare_training():
         net_g.enable_hook()
     else:
         net_g.initialize_vq([wav_iterator(files) for files in speaker_audio_files])
+    emit_progress(
+        phase="training",
+        message="Training the Beatrice model...",
+        percent=45,
+        iteration=initial_iteration,
+        total=h.n_steps,
+        output_dir=out_dir,
+    )
 
     # スケジューラ
 
@@ -4020,6 +4386,14 @@ def prepare_training():
             json.dump(dict(h), f, indent=4)
         if not is_notebook():
             shutil.copy(__file__, out_dir)
+    emit_progress(
+        phase="training",
+        message="Training loop is ready.",
+        percent=45,
+        iteration=initial_iteration,
+        total=h.n_steps,
+        output_dir=out_dir,
+    )
 
     return (
         device,
@@ -4089,6 +4463,12 @@ if __name__ == "__main__" and writer is not None:
         MultiPeriodDiscriminator.forward_and_compute_loss = torch.compile(
             MultiPeriodDiscriminator.forward_and_compute_loss, mode="reduce-overhead"
         )
+    training_batch_source = (
+        CudaBatchPrefetcher(training_loader, device)
+        if device.type == "cuda"
+        else training_loader
+    )
+    collect_training_metrics = bool(h.record_metrics)
 
     # 学習
     with (
@@ -4104,19 +4484,29 @@ if __name__ == "__main__" and writer is not None:
         else nullcontext()
     ) as profiler:
         for iteration in tqdm(range(initial_iteration, h.n_steps), desc="Training"):
+            completed_iteration = iteration + 1
             # === 1. データ前処理 ===
             try:
                 batch = next(data_iter)
             except (NameError, StopIteration):
-                data_iter = iter(training_loader)
+                data_iter = iter(training_batch_source)
                 batch = next(data_iter)
-            (
-                clean_wavs,
-                noisy_wavs_16k,
-                slice_starts,
-                speaker_ids,
-                formant_shift_semitone,
-            ) = map(lambda x: x.to(device, non_blocking=True), batch)
+            if device.type == "cuda":
+                (
+                    clean_wavs,
+                    noisy_wavs_16k,
+                    slice_starts,
+                    speaker_ids,
+                    formant_shift_semitone,
+                ) = batch
+            else:
+                (
+                    clean_wavs,
+                    noisy_wavs_16k,
+                    slice_starts,
+                    speaker_ids,
+                    formant_shift_semitone,
+                ) = map(lambda x: x.to(device, non_blocking=True), batch)
 
             # === 2. 学習 ===
             with torch.amp.autocast("cuda", enabled=h.use_amp):
@@ -4139,21 +4529,26 @@ if __name__ == "__main__" and writer is not None:
                     slice_segment_length=h.segment_length,
                     y_all=clean_wavs[:, None, :],
                     enable_loss_ap=h.grad_weight_ap != 0.0,
+                    return_stats=collect_training_metrics,
                 )
                 if h.compile_convnext:
                     ConvNeXtStack.forward = raw_convnextstack_forward
-                assert y_hat.isfinite().all()
-                assert loss_loudness.isfinite().all()
-                assert loss_mel.isfinite().all()
-                assert loss_ap.isfinite().all()
+                if h.validate_finite:
+                    assert y_hat.isfinite().all()
+                    assert loss_loudness.isfinite().all()
+                    assert loss_mel.isfinite().all()
+                    assert loss_ap.isfinite().all()
 
                 # === 2.2 Discriminator の順伝播 ===
                 loss_discriminator, loss_adv, loss_fm, discriminator_stats = (
-                    net_d.forward_and_compute_loss(y, y_hat)
+                    net_d.forward_and_compute_loss(
+                        y, y_hat, return_stats=collect_training_metrics
+                    )
                 )
-                assert loss_discriminator.isfinite().all()
-                assert loss_adv.isfinite().all()
-                assert loss_fm.isfinite().all()
+                if h.validate_finite:
+                    assert loss_discriminator.isfinite().all()
+                    assert loss_adv.isfinite().all()
+                    assert loss_fm.isfinite().all()
 
             # === 2.3 Discriminator の逆伝播 ===
             for param in net_d.parameters():
@@ -4161,9 +4556,8 @@ if __name__ == "__main__" and writer is not None:
             grad_scaler.scale(loss_discriminator).backward(
                 retain_graph=True, inputs=list(net_d.parameters())
             )
-            loss_discriminator = loss_discriminator.item()
             grad_scaler.unscale_(optim_d)
-            if iteration % 5 == 0:
+            if collect_training_metrics and iteration % 5 == 0:
                 grad_norm_d, d_grad_norm_stats = compute_grad_norm(net_d, True)
             else:
                 grad_norm_d = math.nan
@@ -4183,15 +4577,10 @@ if __name__ == "__main__" and writer is not None:
                 y_hat_for_backward,
                 grad_scaler,
                 skip_update_ema=iteration > 10 and iteration % 5 != 0,
+                return_stats=collect_training_metrics,
             )
-            loss_loudness = loss_loudness.item()
-            loss_mel = loss_mel.item()
-            loss_adv = loss_adv.item()
-            loss_fm = loss_fm.item()
-            if h.grad_weight_ap:
-                loss_ap = loss_ap.item()
             grad_scaler.unscale_(optim_g)
-            if iteration % 5 == 0:
+            if collect_training_metrics and iteration % 5 == 0:
                 grad_norm_g, g_grad_norm_stats = compute_grad_norm(net_g, True)
             else:
                 grad_norm_g = math.nan
@@ -4205,32 +4594,47 @@ if __name__ == "__main__" and writer is not None:
             grad_scaler.update()
 
             # === 3. ログ ===
-            dict_scalars["loss_g/loss_loudness"].append(loss_loudness)
-            dict_scalars["loss_g/loss_mel"].append(loss_mel)
-            if h.grad_weight_ap:
-                dict_scalars["loss_g/loss_ap"].append(loss_ap)
-            dict_scalars["loss_g/loss_fm"].append(loss_fm)
-            dict_scalars["loss_g/loss_adv"].append(loss_adv)
-            dict_scalars["other/grad_scale"].append(grad_scaler.get_scale())
-            dict_scalars["loss_d/loss_discriminator"].append(loss_discriminator)
-            if math.isfinite(grad_norm_d):
-                dict_scalars["other/gradient_norm_d"].append(grad_norm_d)
-                for name, value in d_grad_norm_stats.items():
-                    dict_scalars[f"~gradient_norm_d/{name}"].append(value)
-            if math.isfinite(grad_norm_g):
-                dict_scalars["other/gradient_norm_g"].append(grad_norm_g)
-                for name, value in g_grad_norm_stats.items():
-                    dict_scalars[f"~gradient_norm_g/{name}"].append(value)
-            dict_scalars["other/lr_g"].append(scheduler_g.get_last_lr()[0])
-            dict_scalars["other/lr_d"].append(scheduler_d.get_last_lr()[0])
-            for k, v in generator_stats.items():
-                dict_scalars[f"~loss_generator/{k}"].append(v)
-            for k, v in discriminator_stats.items():
-                dict_scalars[f"~loss_discriminator/{k}"].append(v)
-            for k, v in gradient_balancer_stats.items():
-                dict_scalars[f"~gradient_balancer/{k}"].append(v)
+            if collect_training_metrics:
+                loss_loudness = loss_loudness.item()
+                loss_mel = loss_mel.item()
+                loss_adv = loss_adv.item()
+                loss_fm = loss_fm.item()
+                loss_discriminator = loss_discriminator.item()
+                dict_scalars["loss_g/loss_loudness"].append(loss_loudness)
+                dict_scalars["loss_g/loss_mel"].append(loss_mel)
+                if h.grad_weight_ap:
+                    loss_ap = loss_ap.item()
+                    dict_scalars["loss_g/loss_ap"].append(loss_ap)
+                dict_scalars["loss_g/loss_fm"].append(loss_fm)
+                dict_scalars["loss_g/loss_adv"].append(loss_adv)
+                dict_scalars["other/grad_scale"].append(grad_scaler.get_scale())
+                dict_scalars["loss_d/loss_discriminator"].append(loss_discriminator)
+                if math.isfinite(grad_norm_d):
+                    dict_scalars["other/gradient_norm_d"].append(grad_norm_d)
+                    for name, value in d_grad_norm_stats.items():
+                        dict_scalars[f"~gradient_norm_d/{name}"].append(value)
+                if math.isfinite(grad_norm_g):
+                    dict_scalars["other/gradient_norm_g"].append(grad_norm_g)
+                    for name, value in g_grad_norm_stats.items():
+                        dict_scalars[f"~gradient_norm_g/{name}"].append(value)
+                dict_scalars["other/lr_g"].append(scheduler_g.get_last_lr()[0])
+                dict_scalars["other/lr_d"].append(scheduler_d.get_last_lr()[0])
+                for k, v in generator_stats.items():
+                    dict_scalars[f"~loss_generator/{k}"].append(v)
+                for k, v in discriminator_stats.items():
+                    dict_scalars[f"~loss_discriminator/{k}"].append(v)
+                for k, v in gradient_balancer_stats.items():
+                    dict_scalars[f"~gradient_balancer/{k}"].append(v)
+            emit_progress(
+                phase="training",
+                message=f"Training iteration {completed_iteration}/{h.n_steps}",
+                percent=phase_percent(45, 94, completed_iteration, h.n_steps),
+                iteration=completed_iteration,
+                total=h.n_steps,
+                output_dir=out_dir,
+            )
 
-            if (iteration + 1) % 1000 == 0 or iteration == 0:
+            if collect_training_metrics and ((iteration + 1) % 1000 == 0 or iteration == 0):
                 for name, scalars in dict_scalars.items():
                     if scalars:
                         writer.add_scalar(
@@ -4416,8 +4820,17 @@ if __name__ == "__main__" and writer is not None:
                 1,
                 h.n_steps,
             }:
+                if completed_iteration == h.n_steps:
+                    emit_progress(
+                        phase="exporting_model",
+                        message="Saving final checkpoint and exporting the model bundle...",
+                        percent=95,
+                        iteration=completed_iteration,
+                        total=h.n_steps,
+                        output_dir=out_dir,
+                    )
                 # チェックポイント
-                name = f"{in_wav_dataset_dir.name}_{iteration + 1:08d}"
+                name = f"{in_wav_dataset_dir.name}_{completed_iteration:08d}"
                 checkpoint_file_save = out_dir / f"checkpoint_{name}.pt.gz"
                 if checkpoint_file_save.exists():
                     checkpoint_file_save = checkpoint_file_save.with_name(
@@ -4442,6 +4855,15 @@ if __name__ == "__main__" and writer is not None:
                         f,
                     )
                 shutil.copy(checkpoint_file_save, out_dir / "checkpoint_latest.pt.gz")
+                if completed_iteration == h.n_steps:
+                    emit_progress(
+                        phase="exporting_model",
+                        message="Checkpoint saved. Building the Beatrice model bundle...",
+                        percent=97,
+                        iteration=completed_iteration,
+                        total=h.n_steps,
+                        output_dir=out_dir,
+                    )
 
                 # 推論用
                 paraphernalia_dir = out_dir / f"paraphernalia_{name}"
@@ -4525,6 +4947,18 @@ description = """
 '''
                         )
                 del paraphernalia_dir
+                if completed_iteration == h.n_steps:
+                    emit_progress(
+                        phase="finished",
+                        message="Training finished.",
+                        percent=100,
+                        iteration=completed_iteration,
+                        total=h.n_steps,
+                        output_dir=out_dir,
+                        manifest=out_dir
+                        / f"paraphernalia_{name}"
+                        / f"beatrice_paraphernalia_{name}.toml",
+                    )
 
             # TODO: phone_extractor, pitch_estimator が既知のモデルであれば dump を省略
 
@@ -4534,4 +4968,12 @@ description = """
             if h.profile:
                 profiler.step()
 
+    emit_progress(
+        phase="finished",
+        message="Training finished.",
+        percent=100,
+        iteration=h.n_steps,
+        total=h.n_steps,
+        output_dir=out_dir,
+    )
     print("Training finished.")
