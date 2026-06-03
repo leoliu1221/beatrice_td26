@@ -4,6 +4,99 @@ A running log of experiments, hyperparameter tuning, data scaling, and model beh
 
 ---
 
+## Experiment 5: Tier-1 Converted-Audio Gate — `en_clean` vs `jp122` (Path A re-run)
+**Date:** Jun 3, 2026
+**Objective:** Re-run the PhoneExtractor A/B on the **correct gate** (converted ENGLISH audio, lesson 2.9) after the prior `grad_weight_ap` A/B (`outputs/ab_ap*_v2`) was invalidated by the collapsed v2 extractor (lesson 2.6). Two identical Path A converters trained 60k steps on `preprocessed/new_lol_data_df`, differing **only** in the frozen PhoneExtractor:
+- `outputs/path_a_en_clean` — `en_clean_580k` (English-distilled, LibriSpeech-100).
+- `outputs/path_a_jp122_baseline` — `jp_122_3000k` (upstream).
+
+### Harness
+- `analysis/convert_eval.py` — converted n=40 English LibriSpeech clips (`analysis/data/ls_aligned.pkl`) to targets `sion` + `noxus_male`. Both loaded at iter=60000, n_speakers=6. Output under `analysis/converted/{en_clean_60k,jp122_60k}/`.
+- `analysis/score_converted.py` — PER (wav2vec2-espeak IPA, source→ref vs converted→hyp), WER (Whisper base.en), UTMOS, SPK (WavLM-SV cosine to real target centroid; SPK_src = sim to source, want low).
+
+### Results (n=40 per target)
+| target | tag | PER ↓ | WER ↓ | UTMOS ↑ | SPK ↑ | SPK_src ↓ |
+|---|---|---|---|---|---|---|
+| sion | `en_clean_60k` | **0.282** | **0.600** | 2.023 | **0.941** | 0.586 |
+| sion | `jp122_60k` | 0.286 | 0.822 | **2.305** | 0.939 | 0.576 |
+| noxus_male | `en_clean_60k` | 0.269 | 0.470 | 2.494 | **0.928** | 0.754 |
+| noxus_male | `jp122_60k` | **0.266** | **0.277** | **2.970** | 0.878 | 0.759 |
+
+JSON: `analysis/converted_quality_sion.json`, `analysis/converted_quality_noxus_male.json`.
+
+### Findings
+- **PER**: tied across the board (within noise) — the IPA recognizer does not separate the two extractors.
+- **WER**: **contradictory across speakers** — `en_clean` far more intelligible on `sion` (0.60 vs 0.82) but `jp122` far more intelligible on `noxus_male` (0.28 vs 0.47). No consistent intelligibility winner. Objective metrics do NOT settle the A/B.
+- **UTMOS**: `jp122` wins **both** targets — consistent with it being the richer extractor (effective_rank 18.8 vs 12.9, lesson 2.6).
+- **SPK**: `en_clean` wins both (esp. noxus_male, 0.928 vs 0.878), but `SPK_src ≈ 0.75` on noxus (male→male) means the gap is more meaningful than the absolute value.
+
+### Listening test (the gate) — `en_clean` FAILS
+- Built `analysis/listening_test.html`: blind, per-item randomized A/B over the 40 clips, target + criterion selectors, served via `python -m http.server` from `analysis/`.
+- **Verdict (user listen, 2026-06-03):** several `en_clean` conversions are **clearly muffled / under-articulated** — the "big tongue" signature again (lessons 2.2, 2.6, 2.8). UTMOS correctly predicted this; PER/WER did not.
+- **Decision: do NOT promote `en_clean`. `jp_122` stays `current.pt`.** The English-distillation effort remains a net *perceived-quality* regression despite being measurably more English-correct on label probes (lesson 2.8). UTMOS is the cheap metric that tracked the muffle; PER/WER were inconclusive/contradictory here.
+
+### Plan: PhoneExtractor v3 — REVISED 2026-06-03 (jp_122 richness is a HARD constraint)
+**Reframe after the listening verdict.** The user is certain, from listening, that `jp_122` is the better extractor because it captures **all** phonetic features with no muffled "big-tongue" mask. So v3 is no longer "balance richness vs English-correctness" — **richness/articulation is a non-negotiable constraint, and English-contrast correction is only a small, bounded nudge on top of jp_122.**
+
+**What is now ruled out (failed twice — stop trying):**
+- **From-scratch English distillation is ABANDONED.** v1 `en_clean_580k` (muffled @580k) and v2 `en_nr_targetmix` (collapsed) both produced the big-tongue mask. The root cause is structural (lesson 2.6): asking a 128-dim student to *wholesale-match* a clean 768-dim SSL teacher forces a phoneme-agnostic average. **Do not re-distill the whole representation from any clean SSL teacher again** — that is the step that smears, regardless of data scale or teacher choice.
+- Therefore **DROP** the old plan's items "scale to LibriSpeech-960 / ≥1M from scratch" and "wholesale richness-preserving re-distillation" — both still re-learn the entire space and re-incur the muffle risk.
+
+**New approach — anchored, targeted correction of jp_122 (richness preserved by construction):**
+1. **Mandatory warm-start = jp_122.** The student *is* jp_122 at step 0; training may only perturb it.
+2. **jp_122-preservation anchor (dominant loss term).** Keep student features close to the **frozen jp_122** features (e.g. high-weight cos/MSE to jp_122's own output). This pins the rich geometry the user validated; it is the safeguard against the muffle, not an afterthought.
+3. **English correction = a gentle, *targeted* nudge, NOT full HuBERT regression.** Only push on the specific contrasts jp_122 merges (R/L, TH/S, V/B, DH/D — measured low in lesson 2.8). Preferred form: a **supervised contrastive / triplet loss on hard phoneme pairs** using REAL MFA labels (`analysis/fetch_librispeech_aligned.py`), so we directly pull those categories apart without asking the student to imitate HuBERT's entire 768-dim manifold. Weight this term **small** relative to the anchor.
+4. **Richness is the gate, checked every eval (abort conditions):**
+   - `effective_rank` (`probe_phone_extractor.py`) must stay **≥ jp_122 (18.8)** — abort the run if it drops beyond a small margin.
+   - **UTMOS** on converted English must not regress vs jp_122 (cheap muffle proxy — the only Tier-1 metric that tracked the listening verdict).
+   - `phone_acc` / hard-pair ABX (`probe_phone_abx.py`) must **improve** over jp_122 (the only thing v3 is allowed to win on).
+   - Final promotion: blind listening test must show **zero added muffle** AND audible R/L·TH·V improvement. Either failing = no promotion.
+5. **Augmentation:** noise (SNR ≥ 20 dB) + mild reverb ONLY. No LPF, no formant-shift, no target-mix (lessons 2.5/2.6).
+6. **Go/No-Go reality check (do this FIRST, cheaply).** jp_122 is the confirmed champion; v3 is upside-only on accent and must not touch articulation. Run a **short pilot (~50–100k steps)** of the anchored-correction recipe. If it cannot beat jp_122 on hard-pair ABX **without any** effective_rank/UTMOS regression, **STOP and keep jp_122** — accept the residual accent rather than risk the mask. Only scale up a pilot that has already proven it can improve contrasts at zero richness cost.
+
+**De-prioritized (only as a *correction signal* source, never as a new full teacher):** WavLM-Large / ContentVec hard-pair embeddings could supply the contrastive targets in step 3; they are NOT a replacement teacher for wholesale distillation.
+
+### Judging method (researched + adopted 2026-06-03)
+Literature review (ContentVec ICML'22; DC-Spin Interspeech'25; SUPERB-headless arXiv:2308.14456) → a PhoneExtractor is judged on a **two-axis panel**, never a single metric (lesson 2.9 anti-Goodhart):
+- **Richness / articulation (the hard constraint, muffle detector)** — `analysis/probe_phone_extractor.py`: `effective_rank` (participation ratio ↑), `temporal_contrast` ↑, `mean_pairwise_cos` ↓. These caught the "big tongue".
+- **English correctness** — `analysis/probe_phone_abx.py`: `phone_acc` (linear probe ↑), **`PNMI` (NEW)**, and hard-pair ABX ↓ (R/L, TH/S, V/B, DH/D). **PNMI** = mutual information between k-means clusters of frames and MFA phone labels, normalised by phone entropy; DC-Spin shows it is a *more reliable* proxy than ABX (which can mislead). It needs no trained probe, so it cross-checks `phone_acc` for Goodhart.
+- *(Documented but not run here — needs a speaker-balanced set, which `ls_aligned.pkl` is not: 127 spk / 200 utt)*: **speaker-invariance** (ContentVec) — a VC content encoder's features should NOT linearly predict speaker; lower speaker-probe acc = better.
+- **Final gate stays Tier-1** converted-audio UTMOS + blind listening (lesson 2.9). Intrinsic panel is only a screen.
+
+**Judging result — jp_122 vs en_clean (validated method, 2026-06-03):**
+| extractor | eff_rank ↑ | temp_contrast ↑ | mean_pair_cos ↓ | phone_acc ↑ | PNMI ↑ | R/L ABX ↓ | TH/S ↓ |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| HuBERT-L9 (ceiling) | — | — | — | 0.817 | 0.615 | 0.190 | 0.159 |
+| **jp_122 (upstream)** | **18.8** | **0.419** | **0.102** | 0.516 | 0.393 | 0.389 | 0.433 |
+| en_clean_580k | 12.9 | 0.247 | 0.134 | **0.697** | **0.474** | **0.264** | **0.326** |
+- **PNMI corroborates phone_acc** (en_clean 0.474 > jp_122 0.393), and both agree with hard-pair ABX → the English-correctness gap is real, not a linear-probe artifact. The tension is now measured on 5 axes: jp_122 owns richness, en_clean owns correctness. v3 must close correctness without dropping eff_rank.
+
+### v3 Go/No-Go pilot — LAUNCHED 2026-06-03
+- **Trainer**: `phone_extractor_trainer/train_v3.py` (new). Loss = `1.0·L_anchor + 0.15·L_supcon`:
+  - `L_anchor` = `1 - cos(student, frozen jp_122)` on diverse unlabelled English (`datasets/librispeech/.../train-clean-100`, 28.5k flac) — pins richness everywhere.
+  - `L_supcon` = supervised contrastive (Khosla) over frame features of a **disjoint** labelled set (`analysis/data/ls_aligned_train.pkl`, 175 utts / 10.7k phone segs, fetched with `fetch_librispeech_aligned.py --skip 200` so it does NOT overlap the 200-utt probe/eval set → probe stays non-circular).
+  - student warm-started from jp_122; jp_122 frozen as anchor; `effective_rank` logged every 100 steps as the abort gate.
+- **Launch**: `outputs/phone_extractor_en_v3`, 80k steps, lr 1e-4 cosine, batch 16 (anchor) + 8 (supcon), ~12 it/s (~1h50m). Log: `outputs/phone_extractor_en_v3_train.log`.
+- **Early signal (step ~300)**: `effective_rank` 25–33 (≥ jp_122's 18.8 → richness gate satisfied, NOT collapsing); `anchor_cos` 0.98→0.91 (SupCon reshaping toward English contrasts, as intended). `l_supcon` ~6.4.
+- **Next**: at checkpoints, run the judging panel (`probe_phone_extractor` + `probe_phone_abx`) — promote to Tier-1 only if eff_rank stays ≥ jp_122 AND phone_acc/PNMI/hard-pairs beat jp_122. Then convert + blind listen. If it can't beat jp_122 on hard-pairs at zero richness cost → keep jp_122 (Go/No-Go).
+
+### v3 (80k) judged → FAILED Go/No-Go (no intelligibility gain). User goal clarified = "intelligible words".
+Judged `checkpoint_00080000.pt` on the full panel (added to both probes as `en_v3_anchored_80k`):
+| extractor | eff_rank ↑ | temp_contrast ↑ | phone_acc ↑ | PNMI ↑ | R/L ↓ | TH/S ↓ | V/B ↓ | DH/D ↓ |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| jp_122 | 18.8 | 0.42 | 0.516 | 0.393 | 0.389 | 0.433 | 0.441 | 0.472 |
+| **en_v3_80k** | 14.0 | 0.40 | 0.529 | 0.398 | 0.388 | 0.435 | 0.444 | 0.465 |
+| en_clean_580k | 12.9 | 0.25 | 0.698 | 0.474 | 0.264 | 0.326 | 0.290 | 0.318 |
+- **Result: v3 ≈ jp_122.** Articulation preserved (temp_contrast 0.40, near jp_122) but the **hard contrasts did not move** (R/L 0.388, TH/S 0.435, ... all within ±0.01 of jp_122); phone_acc/PNMI gained ~nothing (within noise). eff_rank fell 18.8→14.0. → paid a small richness cost for **zero intelligibility gain**. DO NOT promote.
+- **Root cause**: `alpha=1.0` anchor to jp_122 **dominated** the small `beta=0.15` diffuse SupCon. The anchor pins exactly the frames we need to change (jp_122 *merges* R/L, TH/S), and SupCon spread over 39 classes couldn't overcome it on the specific pairs. **Lesson: to fix the accent you must explicitly, surgically move the confusable contrasts; a broad correction under a strong jp_122 anchor cannot.**
+
+### v3.1 — surgical hard-pair correction, LAUNCHED 2026-06-03
+- **Change to `train_v3.py`**: added `hardpair_loss` = `mean relu(cos(a_i,b_j) - margin)` over the merged pairs (R/L, TH/S, V/B, DH/D, S/SH, IH/IY, AE/EH), which **directly pushes apart** exactly the contrasts that didn't move. New loss = `1.0·L_anchor + 0.5·L_supcon + 1.0·L_hardpair` (args `--gamma`, `--hardpair-margin`). Calibrated: `hp` term ~0.30 at init, active.
+- **Launch**: `outputs/phone_extractor_en_v3_1`, warm-start jp_122, 80k steps, pid 1832903, log `..._v3_1_train.log`. Early: `hp` 0.30→0.24 (pairs separating), `eff_rank` ~34 (richness OK).
+- **Validation chain (user goal = intelligible words)**: (1) intrinsic gate at ~20k — hard-pair ABX must drop toward en_clean AND temp_contrast/eff_rank hold; if hard-pairs don't move, abort. (2) If intrinsic passes, train a Path A converter + score **WER (Whisper) + UTMOS** on converted English (intelligibility = the user's actual target) + blind listen. Intrinsic correctness is necessary but NOT sufficient (en_clean was correct-on-probe yet muffled-on-audio); v3.1's edge is it keeps jp_122 articulation while fixing contrasts.
+
+---
+
 ## Experiment 4: Noise-Robust Feature Extractor Re-Distillation
 **Date:** May 28, 2026  
 **Objective:** Fix the **train/test mismatch** between the feature extractors and Beatrice's main trainer that causes "noise during speech" at inference.

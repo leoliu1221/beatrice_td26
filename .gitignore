@@ -6,3 +6,7 @@ outputs
 preprocessed
 datasets
 _inspect_*.py
+analysis/data
+analysis/converted
+*.pkl
+*.npy

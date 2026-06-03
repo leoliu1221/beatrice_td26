@@ -20,6 +20,12 @@
     "aug_target":        0.6549
   },
   "deprecated": true,
-  "superseded_by": "phone_extractor/en_nr_targetmix02_300k.pt",
-  "notes": "v1 production. Clean-only distillation overfit to LibriSpeech; weak on target domain. Kept for ablation only."
+  "probe": {
+    "script": "analysis/probe_phone_extractor.py",
+    "effective_rank": 12.9,
+    "temporal_contrast": 0.247,
+    "mean_pairwise_cos": 0.134,
+    "note": "Richest of the TRAINED English extractors, but still less rich than the upstream jp_122 (18.8). v1 English distillation was an under-trained regression from upstream."
+  },
+  "notes": "Not current. Clean-only English distillation (warm-started from jp_122). Probe shows it is less phonetically rich than the upstream jp_122 it was derived from, so current was set to jp_122 instead. The earlier 'weak on target domain' note referred to cos-sim, which does not predict articulation quality."
 }

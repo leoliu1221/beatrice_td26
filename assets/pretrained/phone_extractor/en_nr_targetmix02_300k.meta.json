@@ -21,6 +21,15 @@
     "clean_target":      0.8390,
     "aug_target":        0.7755
   },
-  "supersedes": ["phone_extractor/en_clean_580k.pt"],
-  "notes": "Beats en_clean_580k by +0.130 on clean target, +0.121 on aug target. Use as current."
+  "deprecated": true,
+  "regressed": true,
+  "superseded_by": "phone_extractor/en_clean_580k.pt",
+  "probe": {
+    "script": "analysis/probe_phone_extractor.py",
+    "effective_rank": 8.6,
+    "temporal_contrast": 0.193,
+    "mean_pairwise_cos": 0.153,
+    "vs_en_clean_580k": "-34% effective rank, lower temporal contrast, higher frame self-similarity"
+  },
+  "notes": "REGRESSION. The high target-domain cos-sim (0.84) was misleading: it measured consistency with HuBERT-on-denoised-TTS (itself smeared), not phonetic separability. The noise-robust augmentation (LPF to 2kHz forces fricative-band hallucination) + 20% target-mix collapsed the phone representation, producing 'big tongue' mumbled conversions in both grad_weight_ap A/B runs. Do NOT use. See lesson 2.2/2.6 in project_context.md."
 }

@@ -2,21 +2,23 @@
   "comment": "Registry of all pretrained model variants. Each module has a 'current' symlink (current.pt) that configs should reference for stable resolution. Variants are immutable; never overwrite an existing variant file.",
   "phone_extractor": {
     "current_symlink": "phone_extractor/current.pt",
-    "current_target": "en_nr_targetmix02_300k.pt",
+    "current_target": "jp_122_3000k.pt",
+    "selection_note": "Select phone extractors by the phonetic-contrast probe (analysis/probe_phone_extractor.py: effective_rank/temporal_contrast), NOT by cosine-similarity to HuBERT. Cos-sim rewards consistency with a (possibly smeared) target, not phonetic separability -- it misled us twice (lesson 2.2). The upstream jp_122 has the richest representation of all variants (even on English clips) and is the empirical 'worked great' baseline; our English-distillation variants (v1/v2) were regressions.",
     "variants": [
-      {"file": "phone_extractor/jp_122_3000k.pt",                 "kind": "upstream"},
-      {"file": "phone_extractor/en_clean_200k.pt",                "kind": "trained", "deprecated": true},
-      {"file": "phone_extractor/en_clean_580k.pt",                "kind": "trained", "deprecated": true},
-      {"file": "phone_extractor/en_nr_targetmix02_300k.pt",       "kind": "trained", "current": true}
+      {"file": "phone_extractor/jp_122_3000k.pt",                 "kind": "upstream", "current": true, "probe_effective_rank": 18.8, "note": "Upstream Beatrice original (122_checkpoint_03000000.pt). Richest/sharpest phonetic representation of all variants, even on English clips. Empirical 'worked great' baseline. Restored to current 2026-06-02."},
+      {"file": "phone_extractor/en_clean_200k.pt",                "kind": "trained", "deprecated": true, "probe_effective_rank": 7.9, "note": "known muffled/slurred"},
+      {"file": "phone_extractor/en_clean_580k.pt",                "kind": "trained", "deprecated": true, "probe_effective_rank": 12.9, "note": "v1 English distillation; under-trained reproduction, less rich than upstream jp_122"},
+      {"file": "phone_extractor/en_nr_targetmix02_300k.pt",       "kind": "trained", "deprecated": true, "regressed": true, "probe_effective_rank": 8.6, "note": "REGRESSION: noise-robust+target-mix recipe collapsed phonetic contrast (-34% effective rank vs en_clean_580k) -> 'big tongue' mumbled conversions. High target cos-sim (0.84) was the lesson-2.2 trap. Do NOT use."}
     ]
   },
   "pitch_estimator": {
     "current_symlink": "pitch_estimator/current.pt",
-    "current_target": "vctk_nr_300k.pt",
+    "current_target": "jp_104_3_300k.pt",
+    "selection_note": "Probe (analysis/probe_pitch_estimator.py, vs pyworld GT) shows all three are close (<0.8 st err, corr 0.89-0.95). jp_104 upstream is the most noise-robust (best on noisy input) and competitive on clean; the noise-robust vctk_nr showed NO advantage (worst on noisy). Reverted to upstream jp_104 to match the full 'worked great' upstream stack with jp_122. Pitch is not where quality problems live.",
     "variants": [
-      {"file": "pitch_estimator/jp_104_3_300k.pt",  "kind": "upstream"},
+      {"file": "pitch_estimator/jp_104_3_300k.pt",  "kind": "upstream", "current": true, "note": "Upstream Beatrice original. Most noise-robust in probe; restored to current 2026-06-02."},
       {"file": "pitch_estimator/vctk_clean_300k.pt", "kind": "trained", "deprecated": true},
-      {"file": "pitch_estimator/vctk_nr_300k.pt",   "kind": "trained", "current": true}
+      {"file": "pitch_estimator/vctk_nr_300k.pt",   "kind": "trained", "deprecated": true, "note": "noise-robust recipe; probe showed no benefit (worst on noisy input). Not current."}
     ]
   },
   "vocoder": {

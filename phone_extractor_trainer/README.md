@@ -13,7 +13,39 @@ section.
 
 ---
 
-## How we reconstructed the original training recipe
+## ⚠️ CORRECTION (2026-06-03): the original objective was CLASSIFICATION, not regression
+
+**The reconstruction below (cos+MSE feature *regression*) was an early guess and
+is WRONG about the training objective.** Evidence gathered later:
+
+1. **`README.original.md` Reference** states **Soft-VC** is the basis for
+   `PhoneExtractor`. Soft-VC ([van Niekerk et al.](https://arxiv.org/abs/2111.02392),
+   `bshall/hubert`) trains its content encoder by **predicting a distribution
+   over discrete units (k-means of HuBERT) via cross-entropy** — a
+   **classification** objective. It does *not* regress continuous HuBERT vectors.
+2. Project Beatrice publishes **`prj-beatrice/japanese-hubert-base-phoneme-ctc`**
+   — `rinna/japanese-hubert-base` fine-tuned with a **phoneme-CTC** head on
+   pyopenjtalk labels (ReazonSpeech). A supervised phoneme target.
+
+**Why this matters (root cause of the muffle):** regression to continuous targets
+(`cos+MSE`, this trainer's `train.py`) collapses features toward the conditional
+mean of all sounds at a frame → low `effective_rank` → the muffled "big tongue".
+A **categorical** target forces phoneme-discriminative features → high rank,
+sharp articulation, clear words. This is exactly why the shipped jp_122
+(categorical) is rich while our `en_clean` (regression) is muffled. jp_122's
+English accent (R/L, TH, V merged) is because its phoneme inventory was Japanese.
+
+**Use `train_v4.py` (Soft-VC unit classification), not `train.py`, for new runs.**
+`train.py`/`train_v3.py` are kept for reference and reproducibility of the v1–v3
+experiments only. See `project_context.md` lesson 2.10 and `experimental_log.md`.
+
+---
+
+## (Historical, superseded) How we *first* reconstructed the recipe
+
+> The following inference was made before the evidence above; it correctly
+> identified the **teacher** (HuBERT) and architecture but **mis-identified the
+> objective** as regression. Retained for history.
 
 The shipped `122_checkpoint_03000000.pt` was packaged for inference only:
 
@@ -26,32 +58,47 @@ no optimizer state, no extra heads, no quantizer codebooks
 ```
 
 The training-side supervision head was deliberately stripped before publish.
-But the architecture + the published references narrow it down to one
-recipe with very high confidence:
+The architecture + published references established:
 
 1. The parent README cites **Soft-VC** as the inspiration for PhoneExtractor.
-   Soft-VC trains its content encoder by **distillation from HuBERT**.
+   *(Correction: Soft-VC's objective is unit **classification**, not feature
+   regression — see the correction note above.)*
 2. The output is **128-dim continuous features** with `weight_norm` on the
-   final head — i.e. *soft* (continuous) units, not discrete codes. Beatrice's
-   `ConverterNetwork` adds VQ *on top* (per-speaker codebooks at
-   `@/beatrice_trainer/__main__.py:2178-2184`), so the PhoneExtractor itself
-   is unquantized.
+   final head — the *soft units*. Beatrice's `ConverterNetwork` adds VQ *on top*
+   (per-speaker codebooks at `@/beatrice_trainer/__main__.py:2178-2184`), so the
+   PhoneExtractor itself is unquantized.
 3. The `FeatureExtractor` (6 conv layers, total stride 160) is the **wav2vec
    2.0 feature extractor minus one stride layer** — explicitly cited by the
    parent README.
 4. Input is fixed at 16 kHz (`"in_sample_rate": 16000, # 変更不可` in
    `default_config.json`), giving the student a 100 fps output rate. HuBERT
-   BASE is 50 fps from 16 kHz — exactly 2× ratio, easy to bridge with a
-   linear-interpolated teacher.
-
-**Conclusion:** the original training was Soft-VC-style HuBERT distillation
-on a Japanese-leaning corpus. This trainer reproduces the recipe but with
-HuBERT BASE trained on English (LibriSpeech-960h, via
-`torchaudio.pipelines.HUBERT_BASE`).
+   BASE is 50 fps from 16 kHz — exactly 2× ratio.
 
 ---
 
-## Training recipe in detail
+## v4 recipe — Soft-VC unit classification (CURRENT, `train_v4.py`)
+
+| Component | Choice | Why |
+|---|---|---|
+| **Student** | `PhoneExtractor()` default ctor | Bit-compatible with Beatrice |
+| **Teacher** | `HUBERT_BASE` layer **9**, frozen | English SSL; richest phonetic layer |
+| **Units** | **k-means (K=500)** over HuBERT-L9 frames | The Soft-VC discrete units (cached in out-dir) |
+| **Head** | `nn.Linear(128, K)`, training-only | Maps soft unit → unit logits; **dropped at export** |
+| **Loss** | **cross-entropy** vs each frame's unit id | The categorical objective that preserves richness |
+| **Frame rate** | teacher 50 fps → labels `repeat_interleave(2)` → 100 fps | Aligns to student |
+| **Optimizer / schedule** | `AdamW(5e-4)`, warmup→cosine | Same as v1 |
+| **Init** | from scratch (or `--init-from`) | From scratch isolates objective vs `en_clean` |
+
+```bash
+uv run python -m phone_extractor_trainer.train_v4 \
+    --data-dir datasets/librispeech/LibriSpeech/train-clean-100 \
+    --out-dir outputs/phone_extractor_en_v4 \
+    --n-clusters 500 --steps 200000
+```
+
+---
+
+## (Superseded) v1/v2 regression recipe — `train.py`
 
 | Component | Choice | Why |
 |---|---|---|

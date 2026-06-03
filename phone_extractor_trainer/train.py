@@ -166,6 +166,20 @@ def train(args: argparse.Namespace) -> None:
         aux_files = discover_audio_files(Path(args.target_data_dir))
         print(f"target-domain mix: {len(aux_files)} files, ratio={args.target_mix_ratio}")
 
+    # Lesson 2.6: only phonetic-preserving degradations belong in phone
+    # distillation. Disable LPF and formant-shift by default (they collapse
+    # the representation); keep additive noise + reverb.
+    aug_kwargs = {
+        "lpf_probability": args.aug_lpf_prob,
+        "formant_shift_probability": args.aug_formant_prob,
+    }
+    if args.augment and (args.aug_lpf_prob > 0 or args.aug_formant_prob > 0):
+        print(
+            f"WARNING: aug_lpf_prob={args.aug_lpf_prob}, "
+            f"aug_formant_prob={args.aug_formant_prob} are nonzero. These "
+            "degrade phonetic content and risk 'big tongue' collapse (lesson 2.6)."
+        )
+
     dataset = WavCropDataset(
         files=files,
         wav_length=wav_length,
@@ -174,6 +188,7 @@ def train(args: argparse.Namespace) -> None:
         seed=args.seed,
         noise_files=noise_files,
         ir_files=ir_files,
+        aug_kwargs=aug_kwargs,
         aux_files=aux_files,
         aux_mix_ratio=args.target_mix_ratio,
     )
@@ -351,6 +366,17 @@ def parse_args() -> argparse.Namespace:
                    help="dir of background noise files (used with --augment)")
     p.add_argument("--ir-dir", type=str, default="assets/ir",
                    help="dir of impulse-response files for reverb (used with --augment)")
+    # Augmentation probabilities. CRITICAL (lesson 2.6): LPF and formant-shift
+    # are *destructive* to phonetic content -- distilling against a clean
+    # teacher under those degradations collapses the phone representation
+    # ("big tongue"). They default to 0.0 here. Only use degradations that
+    # PRESERVE phonetic information (additive noise, mild reverb).
+    p.add_argument("--aug-lpf-prob", type=float, default=0.0,
+                   help="LPF augmentation probability. KEEP 0.0 for phone extractor "
+                        "(see lesson 2.6); nonzero collapses fricative features.")
+    p.add_argument("--aug-formant-prob", type=float, default=0.0,
+                   help="formant-shift augmentation probability. KEEP 0.0 for phone "
+                        "extractor (see lesson 2.6); nonzero collapses vowel features.")
     p.add_argument("--target-data-dir", type=str, default="",
                    help="optional target-domain audio dir to mix in during training")
     p.add_argument("--target-mix-ratio", type=float, default=0.0,

@@ -10,21 +10,33 @@ A fork of [Beatrice 2](https://prj-beatrice.com) voice conversion trainer with a
 
 ### 1. PhoneExtractor Trainer (`phone_extractor_trainer/`)
 
-Retrain the PhoneExtractor on English-only data to remove Japanese phonetic bias.
+Tooling to retrain the PhoneExtractor on English-only data (originally to remove
+Japanese phonetic bias).
 
 ```bash
 make phone-train-en   # One-shot: download LibriSpeech + train + export
 ```
 
+> **Note (2026-06-02):** our English retrains (`en_clean_*`, `en_nr_targetmix02_300k`)
+> turned out **worse** than the upstream `jp_122` extractor on a phonetic-contrast
+> probe and in listening tests, so `current.pt` points at upstream `jp_122`. Keep
+> the trainer for experiments, but a new variant must beat upstream on the probe
+> **and** a listening test before promotion. See the Experiments section and
+> `project_context.md` lessons 2.6 / 2.7.
+
 See [phone_extractor_trainer/README.md](phone_extractor_trainer/README.md) for details.
 
 ### 2. PitchEstimator Trainer (`pitch_estimator_trainer/`)
 
-Retrain the PitchEstimator on diverse pitch data for better cross-gender (female→male) conversion.
+Tooling to retrain the PitchEstimator on diverse pitch data (e.g. for cross-gender
+female→male conversion).
 
 ```bash
 make pitch-train-vctk   # One-shot: download VCTK + preprocess + train + export
 ```
+
+> **Note (2026-06-02):** the noise-robust `vctk_nr_300k` retrain showed no benefit
+> over upstream `jp_104` on an F0 probe, so `current.pt` points at upstream `jp_104`.
 
 See [pitch_estimator_trainer/README.md](pitch_estimator_trainer/README.md) for details.
 
@@ -122,13 +134,13 @@ pretrained registry:
 To swap to a different variant after training, either retarget the symlink:
 
 ```bash
-ln -sfn en_nr_targetmix02_300k.pt assets/pretrained/phone_extractor/current.pt
+ln -sfn jp_122_3000k.pt assets/pretrained/phone_extractor/current.pt
 ```
 
 or pin a specific variant directly in your config (recommended for A/B runs):
 
 ```json
-"phone_extractor_file": "assets/pretrained/phone_extractor/en_nr_targetmix02_300k.pt"
+"phone_extractor_file": "assets/pretrained/phone_extractor/jp_122_3000k.pt"
 ```
 
 See [`assets/pretrained/README.md`](assets/pretrained/README.md) and
@@ -170,11 +182,13 @@ symlink to the recommended variant; the default config resolves through it.
 
 | Module | Current variant | Training data | Notes |
 |---|---|---|---|
-| **PhoneExtractor** | `phone_extractor/en_nr_targetmix02_300k.pt` | LibriSpeech train-clean-100 (+ 20% target-domain mix) | Noise-robust distillation from scratch (300k). Beats the clean v1 580k by +0.13 cos sim on target domain. |
-| **PitchEstimator** | `pitch_estimator/vctk_nr_300k.pt` | VCTK (109 speakers) | Noise-robust distillation from scratch (300k). `formant_shift_probability` forced to 0 to protect pyworld F0 labels. |
+| **PhoneExtractor** | `phone_extractor/jp_122_3000k.pt` (**upstream**) | Upstream Beatrice (Japanese-leaning) | Reverted to upstream 2026-06-02. Our English-distilled variants regressed phonetic richness ("big tongue") — see note below. Richest of all variants on the contrast probe, even on English clips. |
+| **PitchEstimator** | `pitch_estimator/jp_104_3_300k.pt` (**upstream**) | Upstream Beatrice | Reverted to upstream 2026-06-02. The noise-robust `vctk_nr_300k` showed no benefit (worst on noisy input) in the F0 probe. |
 | **Vocoder** | `vocoder/libritts_r_200_2750k.pt.gz` | Upstream LibriTTS-R | Warm-start for the converter network. |
 
-Deprecated variants (e.g. `phone_extractor/en_clean_580k.pt`, `pitch_estimator/vctk_clean_300k.pt`) are kept on disk for ablations but should not be used for new training. Each variant has a sibling `.meta.json` with full recipe + eval scores.
+> **2026-06-02 — upstream stack restored.** A "big tongue" (mumbled / under-articulated) regression in fine-tunes was traced to our **retrained** extractors, not the converter. The English PhoneExtractor distillation (`en_clean_580k`, `en_nr_targetmix02_300k`) collapsed phonetic resolution, and the noise-robust PitchEstimator gave no benefit. Both `current.pt` symlinks were reverted to the upstream `jp_122` / `jp_104` checkpoints. **Cosine similarity to HuBERT is not a sufficient selection metric** — it rewards consistency with a (possibly smeared) target, not phonetic separability. Use the probes in `analysis/` plus a listening test. See `project_context.md` lessons 2.6 / 2.7.
+
+Deprecated/regressed variants (`phone_extractor/en_clean_*.pt`, `phone_extractor/en_nr_targetmix02_300k.pt`, `pitch_estimator/vctk_*.pt`) are kept on disk for ablations but should **not** be used. Each variant has a sibling `.meta.json` with full recipe + eval + probe scores.
 
 ---
 
@@ -259,6 +273,42 @@ Invariant rule going forward: **any change to the distillation recipe must be
 evaluated against the previous baseline on all four conditions before being
 adopted as `current.pt`.**
 
+### Follow-up: the "+0.12 cos sim" win was a mirage (Experiment 4, 2026-06-02)
+
+The v2 table above is **retained for the record but its conclusion is retracted.**
+On fine-tunes, the v2 noise-robust + target-mix PhoneExtractor produced
+mumbled, under-articulated speech ("big tongue") — it *dropped the
+distinguishing features of words*. The higher target-domain cos sim came from
+matching a **smeared** HuBERT-on-denoised-TTS target, not from better phonetic
+fidelity.
+
+A phonetic-contrast probe (`analysis/probe_phone_extractor.py`, measuring
+`effective_rank` / `temporal_contrast` / frame self-similarity on clean clips)
+revealed the collapse, ranking the variants by representation richness:
+
+| PhoneExtractor | effective_rank ↑ | temporal_contrast ↑ |
+|---|---:|---:|
+| `jp_122_3000k` (**upstream**) | **18.8** | **0.42** |
+| `en_clean_580k` (v1) | 12.9 | 0.25 |
+| `en_nr_targetmix02_300k` (v2) | 8.6 | 0.19 |
+| `en_clean_200k` (known muffled) | 7.9 | 0.22 |
+
+The upstream `jp_122` is the **richest of all** — even on English clips — so
+both our English-distilled variants were net regressions. A parallel F0 probe
+(`analysis/probe_pitch_estimator.py`) showed the noise-robust pitch estimator
+gave no benefit either. **Both extractors were reverted to upstream.**
+
+Root causes of the phone collapse: (1) using **LPF (down to 2 kHz)** and
+**formant-shift** as invariance targets against a clean teacher is ill-posed —
+the student cannot recover removed fricative/formant energy, so it averages
+phonemes together; (2) target-mixing against HuBERT features of OOD denoised
+TTS trains the student to match smeared targets. The distillation trainer now
+defaults `--aug-lpf-prob 0` and `--aug-formant-prob 0`; only phonetic-preserving
+degradations (additive noise, mild reverb) should be used. **Selection rule
+(corrected): cos sim is necessary but not sufficient — a new extractor must
+beat upstream on the probe AND in a listening test before promotion.** Full
+write-up in `project_context.md` lessons 2.6 / 2.7.
+
 ### Standard pipeline (DeepFilterNet path)
 
 ```bash
@@ -268,7 +318,7 @@ uv run python denoise_sources_df.py --dataset <name>
 # 2. Segment with permissive VAD
 uv run python preprocess.py --dataset <name>_df --energy-threshold 35
 
-# 3. Train Beatrice (uses noise-robust extractors via `current.pt` symlinks)
+# 3. Train Beatrice (uses the current.pt extractor symlinks -> upstream jp_122 / jp_104)
 uv run python -m beatrice_trainer \
     -d preprocessed/<name>_df \
     -o outputs/<name>_df \
