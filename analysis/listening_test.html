@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Beatrice Tier-1 Blind Listening Test</title>
+<style>
+  :root { --bg:#0f1115; --panel:#1a1d24; --fg:#e6e8eb; --muted:#9aa1ad; --accent:#5b9dff; --good:#3ecf8e; --warn:#ffb454; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+         background:var(--bg); color:var(--fg); }
+  header { padding:18px 24px; border-bottom:1px solid #262a33; position:sticky; top:0; background:var(--bg); z-index:10; }
+  h1 { font-size:18px; margin:0 0 4px; }
+  .sub { color:var(--muted); font-size:13px; }
+  .controls { display:flex; gap:16px; align-items:center; flex-wrap:wrap; margin-top:12px; }
+  label { font-size:13px; color:var(--muted); }
+  select, button { background:var(--panel); color:var(--fg); border:1px solid #303642; border-radius:8px;
+                   padding:7px 12px; font-size:13px; cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  main { padding:18px 24px 80px; max-width:920px; margin:0 auto; }
+  .item { background:var(--panel); border:1px solid #262a33; border-radius:12px; padding:16px; margin-bottom:14px; }
+  .item.done { border-color:#2c4a3a; }
+  .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  .idtag { font-variant-numeric:tabular-nums; color:var(--muted); font-size:12px; min-width:56px; }
+  audio { height:34px; }
+  .ab { display:flex; gap:12px; margin-top:12px; flex-wrap:wrap; }
+  .card { flex:1; min-width:240px; background:#13161c; border:1px solid #2a2f3a; border-radius:10px; padding:10px 12px; }
+  .card h3 { margin:0 0 8px; font-size:13px; color:var(--muted); font-weight:600; }
+  .votes { display:flex; gap:8px; margin-top:12px; flex-wrap:wrap; }
+  .votes button { flex:1; }
+  .votes button.sel { background:var(--accent); color:#001; border-color:var(--accent); font-weight:600; }
+  .tally { position:fixed; bottom:0; left:0; right:0; background:#13161c; border-top:1px solid #262a33;
+           padding:10px 24px; font-size:13px; display:flex; gap:24px; align-items:center; flex-wrap:wrap; }
+  .pill { background:var(--panel); border-radius:20px; padding:4px 12px; }
+  .pill b { color:var(--good); }
+  code { background:#0b0d11; padding:1px 5px; border-radius:4px; color:var(--warn); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Beatrice Tier-1 Blind Listening Test &mdash; en_clean_60k vs jp122_60k</h1>
+  <div class="sub">A/B is <b>blind &amp; randomized per item</b> (which checkpoint is A vs B is hidden until you reveal). Listen to the <b>source</b>, then A and B, then vote on the converted clip you prefer.</div>
+  <div class="controls">
+    <span><label>Target speaker:</label>
+      <select id="target">
+        <option value="sion">sion</option>
+        <option value="noxus_male">noxus_male</option>
+      </select></span>
+    <span><label>Judge on:</label>
+      <select id="criterion">
+        <option value="overall">overall preference</option>
+        <option value="pron">English pronunciation / accent (R/L, TH, V)</option>
+        <option value="natural">naturalness (buzz / artifacts)</option>
+        <option value="timbre">target timbre match</option>
+      </select></span>
+    <button id="reveal">Reveal A/B labels</button>
+    <button id="export">Export results (JSON)</button>
+    <button id="reset">Reset votes</button>
+  </div>
+</header>
+<main id="list"></main>
+<div class="tally" id="tally"></div>
+
+<script>
+const TAGS = ["en_clean_60k", "jp122_60k"];
+const list = document.getElementById("list");
+const tallyEl = document.getElementById("tally");
+const targetSel = document.getElementById("target");
+const critSel = document.getElementById("criterion");
+let revealed = false;
+// votes[criterion][target][id] = "en_clean_60k" | "jp122_60k" | "equal"
+const votes = JSON.parse(localStorage.getItem("blt_votes") || "{}");
+// stable per-(target,id) randomized A/B assignment
+const assign = JSON.parse(localStorage.getItem("blt_assign") || "{}");
+
+function save() {
+  localStorage.setItem("blt_votes", JSON.stringify(votes));
+  localStorage.setItem("blt_assign", JSON.stringify(assign));
+}
+function getAssign(target, id) {
+  const key = target + "/" + id;
+  if (!assign[key]) assign[key] = Math.random() < 0.5 ? [TAGS[0], TAGS[1]] : [TAGS[1], TAGS[0]];
+  return assign[key]; // [tagForA, tagForB]
+}
+function vget(target, id) {
+  const c = critSel.value;
+  return ((votes[c] || {})[target] || {})[id];
+}
+function vset(target, id, tag) {
+  const c = critSel.value;
+  votes[c] = votes[c] || {}; votes[c][target] = votes[c][target] || {};
+  votes[c][target][id] = tag; save();
+}
+
+async function load() {
+  const target = targetSel.value;
+  const m = await (await fetch(`converted/${TAGS[0]}/manifest.json`)).json();
+  list.innerHTML = "";
+  for (const it of m.items) {
+    const id = it.id;
+    const [tagA, tagB] = getAssign(target, id);
+    const item = document.createElement("div");
+    item.className = "item";
+    const sel = vget(target, id);
+    if (sel) item.classList.add("done");
+    item.innerHTML = `
+      <div class="row">
+        <span class="idtag">#${id}</span>
+        <span class="idtag">src</span>
+        <audio controls preload="none" src="converted/${TAGS[0]}/source/${id}.wav"></audio>
+      </div>
+      <div class="ab">
+        <div class="card"><h3>A ${revealed ? "&middot; "+tagA : ""}</h3>
+          <audio controls preload="none" src="converted/${tagA}/${target}/${id}.wav"></audio></div>
+        <div class="card"><h3>B ${revealed ? "&middot; "+tagB : ""}</h3>
+          <audio controls preload="none" src="converted/${tagB}/${target}/${id}.wav"></audio></div>
+      </div>
+      <div class="votes">
+        <button data-v="A">A better</button>
+        <button data-v="equal">Equal</button>
+        <button data-v="B">B better</button>
+      </div>`;
+    const btns = item.querySelectorAll(".votes button");
+    btns.forEach(b => {
+      const v = b.dataset.v;
+      const tagForBtn = v === "A" ? tagA : v === "B" ? tagB : "equal";
+      if (sel === tagForBtn) b.classList.add("sel");
+      b.onclick = () => {
+        vset(target, id, tagForBtn);
+        item.classList.add("done");
+        btns.forEach(x => x.classList.remove("sel"));
+        b.classList.add("sel");
+        renderTally();
+      };
+    });
+    list.appendChild(item);
+  }
+  renderTally();
+}
+
+function renderTally() {
+  const target = targetSel.value, c = critSel.value;
+  const v = (votes[c] || {})[target] || {};
+  let a=0,b=0,e=0,n=0;
+  for (const id in v) { n++; if (v[id]===TAGS[0]) a++; else if (v[id]===TAGS[1]) b++; else e++; }
+  tallyEl.innerHTML =
+    `<span class="pill">criterion: <b>${c}</b> &middot; target: <b>${target}</b></span>`+
+    `<span class="pill">voted: <b>${n}</b>/40</span>`+
+    `<span class="pill">${TAGS[0]}: <b>${a}</b></span>`+
+    `<span class="pill">${TAGS[1]}: <b>${b}</b></span>`+
+    `<span class="pill">equal: <b>${e}</b></span>`;
+}
+
+document.getElementById("reveal").onclick = () => { revealed = !revealed; load(); };
+document.getElementById("export").onclick = () => {
+  const blob = new Blob([JSON.stringify(votes, null, 2)], {type:"application/json"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = "listening_test_results.json"; a.click();
+};
+document.getElementById("reset").onclick = () => {
+  if (!confirm("Clear all votes for ALL criteria/targets?")) return;
+  for (const k in votes) delete votes[k]; save(); load();
+};
+targetSel.onchange = load;
+critSel.onchange = load;
+load();
+</script>
+</body>
+</html>

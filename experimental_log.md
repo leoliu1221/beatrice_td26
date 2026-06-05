@@ -94,6 +94,51 @@ Judged `checkpoint_00080000.pt` on the full panel (added to both probes as `en_v
 - **Change to `train_v3.py`**: added `hardpair_loss` = `mean relu(cos(a_i,b_j) - margin)` over the merged pairs (R/L, TH/S, V/B, DH/D, S/SH, IH/IY, AE/EH), which **directly pushes apart** exactly the contrasts that didn't move. New loss = `1.0·L_anchor + 0.5·L_supcon + 1.0·L_hardpair` (args `--gamma`, `--hardpair-margin`). Calibrated: `hp` term ~0.30 at init, active.
 - **Launch**: `outputs/phone_extractor_en_v3_1`, warm-start jp_122, 80k steps, pid 1832903, log `..._v3_1_train.log`. Early: `hp` 0.30→0.24 (pairs separating), `eff_rank` ~34 (richness OK).
 - **Validation chain (user goal = intelligible words)**: (1) intrinsic gate at ~20k — hard-pair ABX must drop toward en_clean AND temp_contrast/eff_rank hold; if hard-pairs don't move, abort. (2) If intrinsic passes, train a Path A converter + score **WER (Whisper) + UTMOS** on converted English (intelligibility = the user's actual target) + blind listen. Intrinsic correctness is necessary but NOT sufficient (en_clean was correct-on-probe yet muffled-on-audio); v3.1's edge is it keeps jp_122 articulation while fixing contrasts.
+- **STOPPED in favour of v4** (the principled Soft-VC fix): v3.x hard-pair loss is a crude manual stand-in for what a categorical objective gives for free. See Experiment 6.
+
+---
+
+## Experiment 6: v4 Soft-VC categorical objective — chasing richness + English correctness
+**Date:** Jun 3–5, 2026  
+**Objective:** Replace the (wrong) `cos+MSE` regression with the **real** Soft-VC categorical objective (CE to discrete HuBERT-L9 units), then diagnose and fix the richness loss. Trainer: `phone_extractor_trainer/train_v4.py`. Full design rationale in `project_context.md` lessons 2.10–2.11.
+
+### Recipe (`train_v4.py`)
+- (1) k-means HuBERT-BASE-L9 features → K discrete units over English audio (cached `kmeans_kK_l9.pt`); (2) train PhoneExtractor + a training-only head to **predict each frame's unit id by cross-entropy** (128-d output = the "soft unit", head dropped at export). Labels upsampled 2× (HuBERT 50 fps → student 100 fps).
+
+### Monitoring + auto-terminate (`phone_extractor_trainer/watch_richness.py`, NEW)
+- Scores every new numbered checkpoint's `effective_rank` over a FIXED 40-clip held-out set (seed 1234, train-clean-100), logs `richness_monitor.csv`, and SIGTERMs the training PID after `--patience` (5) consecutive checkpoints **below the running max**. Fixed the checkpoint-save off-by-one so numbered ckpts land every 10k steps.
+- ⚠️ This guards against *erosion* (high→low). It will NOT fire on a run that *recovers from collapse* (low→high) — that bit us below.
+
+### Run A: K=500 from scratch
+- `eff_rank` **14.25 @40k → 11.65 @153k** while English-correctness kept improving → **richness erodes with more CE steps**. Banked `outputs/phone_extractor_en_v4/checkpoint_bank_153k.pt`. Raised K→2000 to slow collapse.
+
+### Diagnosis: the limiter is the OBJECTIVE, not the architecture
+- Our `PhoneExtractor` is the *identical* 323-tensor net as jp_122 (loads `missing=0 unexpected=0`) and jp_122 reaches `eff_rank ≈ 20.7`; the 128-dim output is not binding (we sit at 8–14). So capacity is fine.
+- **Mechanism = neural collapse** (Papyan–Han–Donoho): hard CE shrinks within-unit variance and aligns class means to a simplex → destroys sub-phonemic detail → `eff_rank` falls *with* training. jp_122 avoided it via (a) noise on the PhoneExtractor output during training, (b) Soft-VC's soft/distributional framing.
+- **Calibration**: jp_122 features sit at a TINY scale (per-dim std median **0.027**, overall 0.030). Richness = how variance is *distributed* across dims, not magnitude → any VICReg must be **scale-invariant** (normalize by global std; `gamma` = fraction of avg dim scale).
+
+**Apples-to-apples richness (same 40 clips, `watch_richness.score_checkpoint`):**
+| model | eff_rank ↑ | temporal_contrast ↑ | pairwise_cos ↓ |
+|---|---:|---:|---:|
+| **jp_122 (target)** | **20.72** | 0.459 | 0.072 |
+| K500_bank @153k | 11.12 | 0.369 | 0.097 |
+| **rich_200k (all 3 fixes)** | **7.97** | 0.226 | **0.844** |
+
+### Three richness fixes added to `train_v4.py` (opt-in; defaults reproduce plain Soft-VC)
+- `--head-mlp-dim` — MLP CE head so collapse is absorbed by the head, not the exported 128-d features (SimCLR projection-head effect).
+- `--output-noise` — Gaussian noise (× feature std) on the **CE path only**; jp_122 recipe. Exported/regularized features stay clean.
+- `--vicreg-var/--vicreg-cov/--vicreg-gamma` — scale-invariant VICReg variance+covariance on clean exported features (recruits collapsed dims w/o forcing white-noise uniformity).
+
+### ❌ Run B: jp_122 warm-start + ALL THREE fixes at once (`_k2000_rich`) — FAILED
+- lr 1e-4, K=2000, MLP head + noise + VICReg. RESULT = **worst of all** (eff_rank 7.97, pairwise_cos 0.844 = heavily collapsed). CSV: **total collapse early** (cos=1.0000 @10k, eff_rank 0.04) then a slow crawl to 7.97 @200k — never recovered. Even plain K=500 from-scratch (14.25 @40k) beat it.
+- **Diagnosis = head-shock**: a fresh random head's CE gradients nuked the warm-started body in the first few k steps. **Methodology error: changed 4 variables at once (warm-start + MLP head + noise + VICReg) → confounded.** The monitor never tripped because the trajectory was *increasing* (recovering from collapse), the opposite of the erosion shape it guards.
+- **Lesson: ablate ONE variable at a time.**
+
+### 🎯 Run C: frozen-body head-warmup (`_k2000_jpfreeze`) — IN PROGRESS (2026-06-05)
+- New `train_v4.py` flags: `--freeze-body-steps` + `--body-lr-scale` (2-group optimizer: head `lr_scale=1.0`, body `lr_scale=body_lr_scale`). Clean isolation of the head-shock fix — **no VICReg/noise/MLP**.
+- Recipe: warm-start jp_122, **freeze body 5000 steps** (linear head learns English units on jp's rich features), then **unfreeze at body LR 2e-5** (`--lr 2e-4 --body-lr-scale 0.1`, K=2000, 200k steps).
+- Early signal: body frozen → `eff_rank` ~26–29 (richness **intact**), `acc` climbing (0.026 → 0.075 by step 1.3k), `ce` falling — the opposite of Run B's collapse. **Decisive test = does richness HOLD near ~20 after the body unfreezes at 5k?** Monitor's first held-out score at 10k. If it holds while correctness improves → success; if it erodes → re-introduce regularizers one at a time.
+- Reminder (lesson 2.9): `eff_rank` is a proxy VICReg can game; CE stays primary; **blind listening test still decides promotion**.
 
 ---
 
